@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opencdr-mcp"
+version = "0.1.0"
+description = "MCP management server for OpenCDR Core"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MPL-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "DBNZ"}]
+keywords = ["opencdr", "mcp", "security", "detection", "incident-response"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Security",
+]
+dependencies = [
+  "mcp>=1.2.0,<2.0.0",
+  "requests>=2.32.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "pytest>=8,<10",
+  "ruff>=0.12,<1",
+  "twine>=6,<7",
+]
+
+[project.urls]
+Homepage = "https://github.com/dbnz-io/opencdr-mcp"
+Repository = "https://github.com/dbnz-io/opencdr-mcp"
+Issues = "https://github.com/dbnz-io/opencdr-mcp/issues"
+
+[project.scripts]
+opencdr-mcp = "opencdr_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opencdr_mcp"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

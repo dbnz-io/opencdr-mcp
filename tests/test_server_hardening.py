@@ -35,6 +35,14 @@ _ANNOTATION_MATRIX = [
     ("opencdr_status", True, False, True),
     ("opencdr_rules_list", True, False, True),
     ("opencdr_rules_get", True, False, True),
+    ("opencdr_rules_schema", True, False, True),
+    ("opencdr_rules_validate", True, False, True),
+    ("opencdr_rules_evaluate", True, False, True),
+    ("opencdr_rules_runtime_status", True, False, True),
+    ("opencdr_rules_metrics", True, False, True),
+    ("opencdr_rule_releases_plan", True, False, True),
+    ("opencdr_rule_releases_apply", False, True, False),
+    ("opencdr_integrations_replay", False, False, False),
     ("opencdr_lists_list", True, False, True),
     ("opencdr_lists_show", True, False, True),
     ("opencdr_signals_search", True, False, True),
@@ -93,6 +101,9 @@ _READ_TOOLS = {
     "opencdr_status",
     "opencdr_rules_list",
     "opencdr_rules_get",
+    "opencdr_rules_schema",
+    "opencdr_rules_runtime_status",
+    "opencdr_rules_metrics",
     "opencdr_lists_list",
     "opencdr_lists_show",
     "opencdr_signals_search",
@@ -105,6 +116,11 @@ _READ_TOOLS = {
     "opencdr_ir_actions_get",
 }
 _RULES_SETTINGS_WRITE = {
+    "opencdr_rules_validate",
+    "opencdr_rules_evaluate",
+    "opencdr_rule_releases_plan",
+    "opencdr_rule_releases_apply",
+    "opencdr_integrations_replay",
     "opencdr_integrations_put",
     "opencdr_integrations_preview",
     "opencdr_rules_upsert",
@@ -261,7 +277,8 @@ def test_ir_role_upsert_rejects_cross_account_arn(api_env):
 def test_ir_role_upsert_accepts_matching_arn(api_env):
     with patch.object(opencdr, "_request", return_value=(200, {"ok": True})) as mock_req:
         server.opencdr_ir_roles_upsert("123456789012", "arn:aws:iam::123456789012:role/IR")
-    mock_req.assert_called_once()
+    assert mock_req.call_count == 2
+    assert mock_req.call_args.kwargs["json"]["expected_rev"] == 0
 
 
 def test_ir_role_get_invalid_account_never_calls_api(api_env):

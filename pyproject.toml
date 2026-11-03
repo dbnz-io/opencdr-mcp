@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opencdr-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP management server for OpenCDR Core"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,8 +25,9 @@ classifiers = [
   "Topic :: Security",
 ]
 dependencies = [
-  "mcp>=1.2.0,<2.0.0",
+  "mcp>=1.28,<2.0.0",
   "requests>=2.32.0,<3.0.0",
+  "boto3==1.43.119",
 ]
 
 [project.optional-dependencies]

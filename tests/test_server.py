@@ -521,7 +521,9 @@ class TestIrRolesGet:
 class TestIrRolesUpsert:
     def test_builds_correct_payload(self, api_env):
         with patch.object(opencdr, "_request", return_value=(200, {"ok": True})) as mock_req:
-            server.opencdr_ir_roles_upsert("123456789012", "arn:aws:iam::123456789012:role/IR")
+            server.opencdr_ir_roles_upsert(
+                "123456789012", "arn:aws:iam::123456789012:role/IR", expected_rev=3
+            )
         mock_req.assert_called_once_with(
             "PUT",
             "/ir-roles/123456789012",
@@ -531,6 +533,7 @@ class TestIrRolesUpsert:
                 "aws_account_id": "123456789012",
                 "role_arn": "arn:aws:iam::123456789012:role/IR",
                 "enabled": True,
+                "expected_rev": 3,
             },
         )
 

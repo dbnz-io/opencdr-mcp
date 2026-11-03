@@ -38,7 +38,14 @@ jobs:
       - run: python -m pip install --upgrade pip build twine
       - run: python -m build
       - run: python -m twine check dist/*
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9d # v7.0.2
+      - name: Verify installed MCP outside the repository
+        shell: bash
+        run: |
+          python -m venv /tmp/opencdr-mcp-smoke
+          /tmp/opencdr-mcp-smoke/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/opencdr-mcp-smoke/bin/python -c "from opencdr_mcp import server; assert 'opencdr_fleet_status' in server.allowed_tools('observer', 'fleet')"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-distributions
           path: dist/

@@ -6,8 +6,11 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import requests
+
+from .fleet import FleetTarget
 
 
 def _config_file() -> Path:
@@ -30,9 +33,15 @@ def _load_config() -> dict[str, Any]:
     return value
 
 
-def _request(method: str, path: str, url: str, key: str, **kwargs: Any) -> tuple[int, Any]:
+def _request(
+    method: str, path: str, url: str, key: str | FleetTarget, **kwargs: Any
+) -> tuple[int, Any]:
+    if isinstance(key, FleetTarget):
+        return key.request(method, path, **kwargs)
     headers = {"x-api-key": key, "Content-Type": "application/json"}
-    response = requests.request(method, f"{url}{path}", headers=headers, timeout=15, **kwargs)
+    response = requests.request(
+        method, f"{url}{path}", headers=headers, timeout=15, allow_redirects=False, **kwargs
+    )
     try:
         return response.status_code, response.json()
     except ValueError:
@@ -54,7 +63,7 @@ def _merge_channels(existing: dict, new_channels: dict) -> dict:
                 "targets": kept + new_targets,
             }
         else:
-            merged[channel] = new_config
+            merged[channel] = {**existing.get(channel, {}), **new_config}
     return merged
 
 
@@ -71,10 +80,20 @@ def _merge_guardduty_notify(existing: dict, new: dict) -> dict:
 
 def _fetch_existing_settings(url: str, key: str, setting_id: str) -> tuple[dict, dict]:
     """Return the current base settings payload and configured channels."""
-    status, body = _request("GET", f"/settings/{setting_id}", url, key)
-    if status == 404 or not isinstance(body, dict):
+    status, body = _request("GET", f"/settings/{quote(setting_id, safe='')}", url, key)
+    if status == 404:
         return {"notifications_enabled": True}, {}
+    if status < 200 or status >= 300 or not isinstance(body, dict):
+        raise RuntimeError(f"settings read failed: HTTP {status}; no settings write attempted")
     existing_channels = body.get("channels") or {}
     base_payload = {name: value for name, value in body.items() if name != "channels"}
     base_payload.setdefault("notifications_enabled", True)
     return base_payload, existing_channels
+
+
+def connection_mode(config: dict[str, Any] | None = None) -> str:
+    config = _load_config() if config is None else config
+    mode = os.getenv("OPENCDR_CONNECTION_MODE") or config.get("mode", "core")
+    if mode not in {"core", "fleet"}:
+        raise ValueError("OPENCDR_CONNECTION_MODE/mode must be core or fleet")
+    return mode

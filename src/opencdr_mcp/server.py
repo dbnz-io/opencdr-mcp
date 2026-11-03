@@ -1,13 +1,15 @@
 """
-OpenCDR MCP server -- the default management plane for the platform:
+OpenCDR MCP server -- an optional client for Core agent management:
 rules, lists, signals, logs, settings, and IR-role assignments.
 
 Run: opencdr-mcp  (stdio transport)
 Register with Claude Code:
   claude mcp add opencdr -- opencdr-mcp
 
-Configure with OPENCDR_API_URL / OPENCDR_API_KEY. See the OpenCDR Core API
-reference for how to mint a *scoped* key.
+Configure direct Core access with OPENCDR_API_URL / OPENCDR_API_KEY, or set
+OPENCDR_CONNECTION_MODE=fleet and OPENCDR_FLEET_NAME for an IAM-authenticated
+Fleet Manager connection saved by opencdr-deploy. Fleet calls never fall back
+to direct Core credentials. Every Core tool then requires an explicit agent_id.
 
 Capability profiles (OPENCDR_MCP_PROFILE)
 -----------------------------------------
@@ -20,6 +22,7 @@ under. The profile controls *which tools an MCP client can discover/call*:
   operator            -- observer + rules/lists, integrations, and settings
                          writes.
   responder           -- operator + IR-role management and IR-action rollback.
+  administrator       -- responder + fleet registry and broad forwarding tools.
 
 IMPORTANT: the profile is a client-side capability *reduction*, not the
 security boundary. Authorization is enforced by the OpenCDR API against the
@@ -29,11 +32,14 @@ profile with an API key whose scopes match the profile, so the MCP tool set
 and the backend enforcement agree. A responder profile pointed at a
 read-only key will simply get 403s from the API; an observer profile pointed
 at an all-scopes key still cannot mutate anything because the destructive
-tools are never registered.
+tools are never registered. Fleet mode additionally enforces AWS IAM at the
+manager and registration/write-key permissions at Core. MCP profiles do not
+grant AWS permissions. Observer remains the default.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Callable
@@ -44,6 +50,14 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from . import client as opencdr
+from .fleet import (
+    FleetClient,
+    FleetConnection,
+    FleetError,
+    FleetTarget,
+    agent_identifier,
+    relative_path,
+)
 
 mcp = FastMCP("opencdr")
 
@@ -64,6 +78,7 @@ ListMatcher = Literal["exact", "cidr"]
 ListValueType = Literal["string", "ip", "cidr", "iam_user", "arn", "aws_account_id", "resource_id"]
 Order = Literal["asc", "desc"]
 Severity = Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "INFORMATIONAL", "UNKNOWN"]
+FleetConfigKind = Literal["rule", "list", "setting", "ir_role", "integration", "catalog"]
 
 _ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
 # arn:aws:iam::<12-digit-account>:role/<path/name>
@@ -91,15 +106,18 @@ CAP_RULES = "rules"
 CAP_SETTINGS = "settings"
 CAP_IR_ROLES = "ir_roles"
 CAP_IR_ACTIONS_WRITE = "ir_actions"
+CAP_FLEET_REFRESH = "fleet_refresh"
+CAP_FLEET_ADMIN = "fleet_admin"
 
 _OBSERVER_CAPS = frozenset({CAP_READ})
-_OPERATOR_CAPS = _OBSERVER_CAPS | {CAP_RULES, CAP_SETTINGS}
+_OPERATOR_CAPS = _OBSERVER_CAPS | {CAP_RULES, CAP_SETTINGS, CAP_FLEET_REFRESH}
 _RESPONDER_CAPS = _OPERATOR_CAPS | {CAP_IR_ROLES, CAP_IR_ACTIONS_WRITE}
 
 _PROFILE_CAPS: dict[str, frozenset[str]] = {
     "observer": _OBSERVER_CAPS,
     "operator": _OPERATOR_CAPS,
     "responder": _RESPONDER_CAPS,
+    "administrator": _RESPONDER_CAPS | {CAP_FLEET_ADMIN},
 }
 
 
@@ -113,15 +131,19 @@ _ACTIVE_CAPS = _PROFILE_CAPS[PROFILE]
 
 # tool name -> required capability, populated by @_tool at import time.
 _TOOL_CAPS: dict[str, str] = {}
+_FLEET_TOOL_CAPS: dict[str, str] = {}
 
 
-def allowed_tools(profile: str) -> set[str]:
+def allowed_tools(profile: str, mode: str = "core") -> set[str]:
     """Names of the tools a given profile may discover/call. Pure policy."""
     caps = _PROFILE_CAPS.get(profile, _OBSERVER_CAPS)
-    return {name for name, cap in _TOOL_CAPS.items() if cap in caps}
+    catalog = {**_TOOL_CAPS, **(_FLEET_TOOL_CAPS if mode == "fleet" else {})}
+    return {name for name, cap in catalog.items() if cap in caps}
 
 
-def _tool(cap: str, *, annotations: ToolAnnotations) -> Callable[[Callable], Callable]:
+def _tool(
+    cap: str, *, annotations: ToolAnnotations, fleet_only: bool = False
+) -> Callable[[Callable], Callable]:
     """Register a FastMCP tool only if the active profile grants `cap`.
 
     The decorated function is always returned unchanged (so it stays
@@ -130,12 +152,16 @@ def _tool(cap: str, *, annotations: ToolAnnotations) -> Callable[[Callable], Cal
     """
 
     def deco(fn: Callable) -> Callable:
-        _TOOL_CAPS[fn.__name__] = cap
+        (_FLEET_TOOL_CAPS if fleet_only else _TOOL_CAPS)[fn.__name__] = cap
+        if not fleet_only:
+            fn.__doc__ = (
+                fn.__doc__ or ""
+            ) + "\n\nIn fleet mode, supply agent_id explicitly. Core mode leaves agent_id unset."
         # Stash for introspection/testing so the classification can be
         # asserted regardless of which profile happens to be active.
         fn._mcp_capability = cap  # type: ignore[attr-defined]
         fn._mcp_annotations = annotations  # type: ignore[attr-defined]
-        if cap in _ACTIVE_CAPS:
+        if cap in _ACTIVE_CAPS and (not fleet_only or opencdr.connection_mode() == "fleet"):
             mcp.tool(annotations=annotations)(fn)
         return fn
 
@@ -159,6 +185,14 @@ _DESTRUCTIVE = ToolAnnotations(
 _ROLLBACK = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
 )
+# Release application uses revisions; retrying is not an unconditional repeat.
+_RELEASE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
+)
+# Each replay request enqueues a new analysis run.
+_REPLAY = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
 
 
 # ---------------------------------------------------------------------------
@@ -166,13 +200,25 @@ _ROLLBACK = ToolAnnotations(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_api() -> tuple[str, str]:
+def _resolve_api(agent_id: str | None = None) -> tuple[str, str | FleetTarget]:
     """
     Environment variables take precedence over the optional config file.
     Raise instead of exiting: an MCP tool call should return a tool error,
     not kill the server process.
     """
     cfg = opencdr._load_config()
+    if opencdr.connection_mode(cfg) == "fleet":
+        if agent_id is None:
+            raise OpenCDRConfigError(
+                "Fleet mode requires agent_id for Core tools. "
+                "Use opencdr_fleet_agents_list to select an agent."
+            )
+        connection = FleetConnection.from_config(cfg)
+        return connection.url, FleetTarget(connection, agent_id)
+    if agent_id is not None:
+        raise OpenCDRConfigError(
+            "agent_id requires fleet mode; this server is configured for direct Core access"
+        )
     url = os.getenv("OPENCDR_API_URL") or cfg.get("url", "")
     key = os.getenv("OPENCDR_API_KEY") or cfg.get("key", "")
     missing = [
@@ -187,7 +233,7 @@ def _resolve_api() -> tuple[str, str]:
 
 
 def _raise_on_error(status: int, body: Any, context: str) -> None:
-    if status >= 400:
+    if status >= 300:
         msg = body.get("message", body) if isinstance(body, dict) else body
         raise RuntimeError(f"{context}: HTTP {status} — {msg}")
 
@@ -221,9 +267,9 @@ def _require_account_id(aws_account_id: str) -> str:
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_status() -> dict:
+def opencdr_status(agent_id: str | None = None) -> dict:
     """Check OpenCDR API health. Read-only."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     status, body = opencdr._request("GET", "/status", url, key)
     _raise_on_error(status, body, "status")
     return body
@@ -237,14 +283,17 @@ def opencdr_status() -> dict:
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
 def opencdr_rules_list(
-    kind: RuleKind | None = None, page_size: int = 50, next_token: str | None = None
+    kind: RuleKind | None = None,
+    page_size: int = 50,
+    next_token: str | None = None,
+    agent_id: str | None = None,
 ) -> dict:
     """List detection/correlation rules. Read-only.
 
     kind: "signal" or "correlation" (omit for both; detection lists use
     opencdr_lists_list). Paginated: pass the returned next_token to continue.
     """
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     query = _qs(page_size=page_size, rule_kind=kind, next_token=next_token)
     status, body = opencdr._request("GET", f"/rules?{query}", url, key)
     _raise_on_error(status, body, "rules list")
@@ -252,9 +301,9 @@ def opencdr_rules_list(
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_rules_get(rule_id: str, kind: RuleKind) -> dict:
+def opencdr_rules_get(rule_id: str, kind: RuleKind, agent_id: str | None = None) -> dict:
     """Get a rule by id. Read-only. kind must be "signal" or "correlation"."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     query = _qs(rule_kind=kind)
     status, body = opencdr._request("GET", f"/rules/{_seg(rule_id, 'rule_id')}?{query}", url, key)
     if status == 404:
@@ -263,9 +312,133 @@ def opencdr_rules_get(rule_id: str, kind: RuleKind) -> dict:
     return body
 
 
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_rules_schema(agent_id: str | None = None) -> dict:
+    """Read this agent's rule contract, operators, bounds and response target keys."""
+    url, key = _resolve_api(agent_id)
+    status, body = opencdr._request("GET", "/rules/schema", url, key)
+    _raise_on_error(status, body, "rules schema")
+    return body
+
+
+@_tool(CAP_RULES, annotations=_READ_ONLY)
+def opencdr_rules_validate(
+    rule: dict, available_lists: list[str] | None = None, agent_id: str | None = None
+) -> dict:
+    """Validate a candidate without saving it. Core requires the rules scope.
+
+    Omit available_lists to use Core's validation behavior; supply an array to
+    declare candidate list IDs explicitly. Inspect valid/errors before applying.
+    """
+    url, key = _resolve_api(agent_id)
+    payload = {"rule": rule}
+    if available_lists is not None:
+        payload["available_lists"] = available_lists
+    status, body = opencdr._request("POST", "/rules/validate", url, key, json=payload)
+    _raise_on_error(status, body, "rules validate")
+    return body
+
+
+@_tool(CAP_RULES, annotations=_READ_ONLY)
+def opencdr_rules_evaluate(
+    rule: dict,
+    events: list[dict],
+    lists: dict[str, list[str] | dict] | None = None,
+    agent_id: str | None = None,
+) -> dict:
+    """Evaluate a candidate against up to 500 supplied fixture events.
+
+    No rule is saved, notification sent, or response executed. Lists map list IDs
+    to values or complete list snapshots (including matcher/value_type). Core
+    remains responsible for validation and evaluation; the rules scope is required.
+    """
+    url, key = _resolve_api(agent_id)
+    status, body = opencdr._request(
+        "POST",
+        "/rules/evaluate",
+        url,
+        key,
+        json={"rule": rule, "events": events, "lists": lists if lists is not None else {}},
+    )
+    _raise_on_error(status, body, "rules evaluate")
+    return body
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_rules_runtime_status(agent_id: str | None = None) -> dict:
+    """Read stored and evaluator-observed generations. Only verified means active.
+
+    An accepted write can still be propagating; do not infer activation from a
+    successful upsert or release application.
+    """
+    url, key = _resolve_api(agent_id)
+    status, body = opencdr._request("GET", "/rules/runtime-status", url, key)
+    _raise_on_error(status, body, "rules runtime status")
+    return body
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_rules_metrics(
+    rule_id: str | None = None,
+    rule_version: str | None = None,
+    release_id: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    agent_id: str | None = None,
+) -> dict:
+    """Read Core's rule/release aggregates. Preserve and inspect partial results."""
+    url, key = _resolve_api(agent_id)
+    query = _qs(
+        rule_id=rule_id,
+        rule_version=rule_version,
+        release_id=release_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    path = "/rules/metrics" + (f"?{query}" if query else "")
+    status, body = opencdr._request("GET", path, url, key)
+    _raise_on_error(status, body, "rules metrics")
+    return body
+
+
+@_tool(CAP_RULES, annotations=_READ_ONLY)
+def opencdr_rule_releases_plan(manifest: dict, agent_id: str | None = None) -> dict:
+    """Ask Core to plan a rule release without writes; requires rules scope.
+
+    Review creates, updates, disables and deletes. Lists are managed separately.
+    A plan is a preview, not an approval token or a lock on future agent state.
+    """
+    url, key = _resolve_api(agent_id)
+    status, body = opencdr._request("POST", "/rule-releases/plan", url, key, json=manifest)
+    _raise_on_error(status, body, "rule release plan")
+    return body
+
+
+@_tool(CAP_RULES, annotations=_RELEASE)
+def opencdr_rule_releases_apply(manifest: dict, agent_id: str | None = None) -> dict:
+    """Apply a reviewed complete manifest. May disable/delete managed rules.
+
+    Core validates the manifest and guards writes by revision. There is no
+    cross-record transaction: inspect partial failure before retrying. Core
+    replans against current state at apply time; a previous plan is not a frozen
+    diff. Poll opencdr_rules_runtime_status after acceptance until verified.
+    """
+    url, key = _resolve_api(agent_id)
+    status, body = opencdr._request("POST", "/rule-releases/apply", url, key, json=manifest)
+    if status >= 300:
+        # A conflict can follow completed writes. Keep Core's per-rule outcome
+        # visible in the MCP error rather than reducing it to only "message".
+        raise RuntimeError(f"rule release apply: HTTP {status} — {json.dumps(body)}")
+    return body
+
+
 @_tool(CAP_RULES, annotations=_MUTATING)
 def opencdr_rules_upsert(
-    rule_id: str, kind: RuleKind, rule: dict, expected_rev: int | None = None
+    rule_id: str,
+    kind: RuleKind,
+    rule: dict,
+    expected_rev: int | None = None,
+    agent_id: str | None = None,
 ) -> dict:
     """Create or update a rule (PUT -- idempotent upsert, safe to call again).
 
@@ -282,7 +455,7 @@ def opencdr_rules_upsert(
     changed since you read it, the API returns 409 rather than silently
     clobbering that change. Omit it for a plain upsert.
     """
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     payload = {**rule, "rule_id": rule_id, "rule_kind": kind}
     if expected_rev is not None:
         payload["expected_rev"] = expected_rev
@@ -295,12 +468,12 @@ def opencdr_rules_upsert(
 
 
 @_tool(CAP_RULES, annotations=_DESTRUCTIVE)
-def opencdr_rules_delete(rule_id: str, kind: RuleKind) -> dict:
+def opencdr_rules_delete(rule_id: str, kind: RuleKind, agent_id: str | None = None) -> dict:
     """Delete a rule by id. DESTRUCTIVE and irreversible.
 
     kind must be "signal" or "correlation".
     """
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     query = _qs(rule_kind=kind)
     status, body = opencdr._request(
         "DELETE", f"/rules/{_seg(rule_id, 'rule_id')}?{query}", url, key
@@ -325,18 +498,21 @@ def _get_list_or_raise(url: str, key: str, list_id: str) -> dict:
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_lists_list() -> dict:
-    """List all detection lists. Read-only."""
-    url, key = _resolve_api()
-    status, body = opencdr._request("GET", "/lists?page_size=100", url, key)
+def opencdr_lists_list(
+    page_size: int = 100, next_token: str | None = None, agent_id: str | None = None
+) -> dict:
+    """Read one page of list metadata. Pass next_token to continue."""
+    url, key = _resolve_api(agent_id)
+    query = _qs(page_size=page_size, next_token=next_token)
+    status, body = opencdr._request("GET", f"/lists?{query}", url, key)
     _raise_on_error(status, body, "lists list")
     return body
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_lists_show(list_id: str) -> dict:
+def opencdr_lists_show(list_id: str, agent_id: str | None = None) -> dict:
     """Show a list's values. Read-only."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     return _get_list_or_raise(url, key, list_id)
 
 
@@ -347,6 +523,7 @@ def opencdr_lists_replace(
     values: list[str] | None = None,
     matcher: ListMatcher = "exact",
     value_type: ListValueType = "string",
+    agent_id: str | None = None,
 ) -> dict:
     """Create a list, or COMPLETELY REPLACE an existing one. DESTRUCTIVE.
 
@@ -356,7 +533,7 @@ def opencdr_lists_replace(
     incrementally without clobbering existing values, use opencdr_lists_add /
     opencdr_lists_remove instead. Creates the list if it does not exist.
     """
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     payload: dict[str, Any] = {
         "list_id": list_id,
         "matcher": matcher,
@@ -376,7 +553,9 @@ def opencdr_lists_replace(
     return body
 
 
-def _list_compare_and_set(list_id: str, value: str, *, add: bool, context: str) -> dict:
+def _list_compare_and_set(
+    list_id: str, value: str, *, add: bool, context: str, agent_id: str | None = None
+) -> dict:
     """Read-modify-write a single list value under optimistic concurrency.
 
     Reads the list, applies the add/remove, and PUTs it back guarded by the
@@ -385,8 +564,8 @@ def _list_compare_and_set(list_id: str, value: str, *, add: bool, context: str) 
     set -- the API owns the guarantee; this is not a lock). No-ops (value
     already present / already absent) short-circuit without a write.
     """
-    url, key = _resolve_api()
-    for _ in range(_CAS_MAX_ATTEMPTS):
+    url, key = _resolve_api(agent_id)
+    for _ in range(1 if isinstance(key, FleetTarget) else _CAS_MAX_ATTEMPTS):
         item = _get_list_or_raise(url, key, list_id)
         values = list(item.get("values") or [])
         present = value in values
@@ -405,6 +584,10 @@ def _list_compare_and_set(list_id: str, value: str, *, add: bool, context: str) 
         status, body = opencdr._request(
             "PUT", f"/lists/{_seg(list_id, 'list_id')}", url, key, json=item
         )
+        if status == 409 and isinstance(key, FleetTarget):
+            _raise_on_error(
+                status, body, "fleet revision conflict; inspect Core state before retrying"
+            )
         if status == 409:
             continue  # concurrent write -- re-read the current rev and retry
         _raise_on_error(status, body, context)
@@ -416,30 +599,32 @@ def _list_compare_and_set(list_id: str, value: str, *, add: bool, context: str) 
 
 
 @_tool(CAP_RULES, annotations=_MUTATING)
-def opencdr_lists_add(list_id: str, value: str) -> dict:
+def opencdr_lists_add(list_id: str, value: str, agent_id: str | None = None) -> dict:
     """Add a single value to an existing list (no-op if already present).
 
     Concurrency-safe: the write is guarded by the list's `rev` (optimistic
     concurrency, enforced by the API), so a simultaneous edit by another
     writer cannot be silently lost. The list must already exist.
     """
-    return _list_compare_and_set(list_id, value, add=True, context="lists add")
+    return _list_compare_and_set(list_id, value, add=True, context="lists add", agent_id=agent_id)
 
 
 @_tool(CAP_RULES, annotations=_MUTATING)
-def opencdr_lists_remove(list_id: str, value: str) -> dict:
+def opencdr_lists_remove(list_id: str, value: str, agent_id: str | None = None) -> dict:
     """Remove a single value from a list (no-op if not present).
 
     Concurrency-safe: the write is guarded by the list's `rev` (optimistic
     concurrency, enforced by the API).
     """
-    return _list_compare_and_set(list_id, value, add=False, context="lists remove")
+    return _list_compare_and_set(
+        list_id, value, add=False, context="lists remove", agent_id=agent_id
+    )
 
 
 @_tool(CAP_RULES, annotations=_DESTRUCTIVE)
-def opencdr_lists_delete(list_id: str) -> dict:
+def opencdr_lists_delete(list_id: str, agent_id: str | None = None) -> dict:
     """Delete a list entirely. DESTRUCTIVE and irreversible."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     status, body = opencdr._request("DELETE", f"/lists/{_seg(list_id, 'list_id')}", url, key)
     if status == 404:
         return {"found": False, "list_id": list_id}
@@ -473,6 +658,7 @@ def opencdr_signals_search(
     order: Order = "desc",
     next_token: str | None = None,
     integration_id: str | None = None,
+    agent_id: str | None = None,
 ) -> dict:
     """Search detection signals. Read-only.
 
@@ -488,7 +674,7 @@ def opencdr_signals_search(
     provided = [x for x in (severity, event_id, category, integration_id) if x]
     if len(provided) != 1:
         raise ValueError("Provide exactly one of severity, event_id, category, or integration_id")
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     query = _qs(
         limit=limit,
         order=order,
@@ -506,7 +692,9 @@ def opencdr_signals_search(
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_signals_stats(date_from: str | None = None, date_to: str | None = None) -> dict:
+def opencdr_signals_stats(
+    date_from: str | None = None, date_to: str | None = None, agent_id: str | None = None
+) -> dict:
     """Signal counts by severity for a date range. Read-only.
 
     A dashboard/summary view, not a substitute for opencdr_signals_search's
@@ -515,7 +703,7 @@ def opencdr_signals_stats(date_from: str | None = None, date_to: str | None = No
     date-range bound the severity selector of opencdr_signals_search uses).
     Returns {date_from, date_to, counts: {<severity>: <count>, ...}, total}.
     """
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     query = _qs(date_from=date_from, date_to=date_to)
     path = "/signals/stats" + (f"?{query}" if query else "")
     status, body = opencdr._request("GET", path, url, key)
@@ -533,6 +721,7 @@ def opencdr_logs_search(
     limit: int = 25,
     order: Order = "desc",
     next_token: str | None = None,
+    agent_id: str | None = None,
 ) -> dict:
     """Search audit/CloudTrail logs. Read-only.
 
@@ -549,7 +738,7 @@ def opencdr_logs_search(
     provided = [x for x in (service, event_id, event_name) if x]
     if len(provided) != 1:
         raise ValueError("Provide exactly one of service, event_id, or event_name")
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     query = _qs(
         limit=limit,
         order=order,
@@ -572,10 +761,24 @@ def opencdr_logs_search(
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
 def opencdr_integrations_get(
-    integration_id: str = "", jobs: bool = False, job_id: str = ""
+    integration_id: str = "",
+    jobs: bool = False,
+    job_id: str = "",
+    next_token: str | None = None,
+    agent_id: str | None = None,
 ) -> dict:
-    """Get the parser catalog, integration binding, or ingestion job diagnostics."""
-    url, key = _resolve_api()
+    """Read a parser catalog, binding or ingestion jobs, with job-list pagination.
+
+    The catalog does not enumerate saved bindings. Pass an integration_id to read
+    a known binding, jobs=True for its job list, and job_id for diagnostics.
+    """
+    if (jobs or job_id or next_token is not None) and not integration_id:
+        raise ValueError("integration_id is required for job queries")
+    if job_id and not jobs:
+        raise ValueError("jobs=True is required with job_id")
+    if next_token is not None and (not jobs or job_id):
+        raise ValueError("next_token is only supported when listing jobs")
+    url, key = _resolve_api(agent_id)
     path = "/integrations"
     if integration_id:
         path += "/" + _seg(integration_id, "integration_id")
@@ -583,15 +786,39 @@ def opencdr_integrations_get(
             path += "/jobs"
             if job_id:
                 path += "/" + _seg(job_id, "job_id")
+            elif next_token is not None:
+                path += "?" + _qs(next_token=next_token)
     status, body = opencdr._request("GET", path, url, key)
     _raise_on_error(status, body, "integrations get")
     return body
 
 
+@_tool(CAP_SETTINGS, annotations=_REPLAY)
+def opencdr_integrations_replay(
+    integration_id: str, job_id: str, agent_id: str | None = None
+) -> dict:
+    """Enqueue a new analysis-only replay using current binding and rules.
+
+    Each invocation creates a new run; do not blindly retry an ambiguous result.
+    Acceptance is not completion. Inspect ingestion jobs for the result. This
+    does not execute response actions or send notifications.
+    """
+    url, key = _resolve_api(agent_id)
+    path = (
+        f"/integrations/{_seg(integration_id, 'integration_id')}"
+        f"/jobs/{_seg(job_id, 'job_id')}/replay"
+    )
+    status, body = opencdr._request("POST", path, url, key, json={})
+    _raise_on_error(status, body, "integration replay")
+    return body
+
+
 @_tool(CAP_SETTINGS, annotations=_MUTATING)
-def opencdr_integrations_put(integration_id: str, configuration: dict) -> dict:
+def opencdr_integrations_put(
+    integration_id: str, configuration: dict, agent_id: str | None = None
+) -> dict:
     """Create/update a binding; configuration must include expected_rev (0 for create)."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     status, body = opencdr._request(
         "PUT",
         "/integrations/" + _seg(integration_id, "integration_id"),
@@ -605,10 +832,13 @@ def opencdr_integrations_put(integration_id: str, configuration: dict) -> dict:
 
 @_tool(CAP_SETTINGS, annotations=_MUTATING)
 def opencdr_integrations_preview(
-    integration_id: str, configuration: dict, record: dict | str
+    integration_id: str,
+    configuration: dict,
+    record: dict | str,
+    agent_id: str | None = None,
 ) -> dict:
     """Execute the selected parser on one sample; does not activate or emit detections."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     status, body = opencdr._request(
         "POST",
         "/integrations/" + _seg(integration_id, "integration_id") + "/preview",
@@ -621,9 +851,9 @@ def opencdr_integrations_preview(
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_settings_get(setting_id: str = "global") -> dict:
+def opencdr_settings_get(setting_id: str = "global", agent_id: str | None = None) -> dict:
     """Get an OpenCDR settings document by id (default: global). Read-only."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     status, body = opencdr._request("GET", f"/settings/{_seg(setting_id, 'setting_id')}", url, key)
     if status == 404:
         return {"found": False, "setting_id": setting_id}
@@ -637,6 +867,8 @@ def opencdr_settings_set(
     channels: dict | None = None,
     guardduty_notify: dict | None = None,
     notifications_enabled: bool | None = None,
+    routing: dict[str, list[str]] | None = None,
+    agent_id: str | None = None,
 ) -> dict:
     """Update an OpenCDR settings document (idempotent merge upsert).
 
@@ -661,14 +893,18 @@ def opencdr_settings_set(
       {"default": bool, "by_severity": {"HIGH": bool, ...},
        "by_service": {"<svc>": bool, ...},
        "by_severity_and_service": {"HIGH:<svc>": bool, ...}}
+    `routing` replaces the severity-to-channel map when supplied; an omitted
+    map is preserved. An empty map restores Core's default channel routing.
     """
-    url, key = _resolve_api()
-    for _ in range(_CAS_MAX_ATTEMPTS):
+    url, key = _resolve_api(agent_id)
+    for _ in range(1 if isinstance(key, FleetTarget) else _CAS_MAX_ATTEMPTS):
         base_payload, existing_channels = opencdr._fetch_existing_settings(url, key, setting_id)
 
         payload = dict(base_payload)
         if notifications_enabled is not None:
             payload["notifications_enabled"] = notifications_enabled
+        if routing is not None:
+            payload["routing"] = routing
         payload["channels"] = (
             opencdr._merge_channels(existing_channels, channels) if channels else existing_channels
         )
@@ -681,6 +917,10 @@ def opencdr_settings_set(
         status, body = opencdr._request(
             "PUT", f"/settings/{_seg(setting_id, 'setting_id')}", url, key, json=payload
         )
+        if status == 409 and isinstance(key, FleetTarget):
+            _raise_on_error(
+                status, body, "fleet revision conflict; inspect Core state before retrying"
+            )
         if status == 409:
             continue  # concurrent write -- re-fetch, re-merge against latest, retry
         _raise_on_error(status, body, "settings set")
@@ -692,9 +932,9 @@ def opencdr_settings_set(
 
 
 @_tool(CAP_SETTINGS, annotations=_DESTRUCTIVE)
-def opencdr_settings_delete(setting_id: str = "global") -> dict:
+def opencdr_settings_delete(setting_id: str = "global", agent_id: str | None = None) -> dict:
     """Delete an OpenCDR settings document by id. DESTRUCTIVE and irreversible."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     status, body = opencdr._request(
         "DELETE", f"/settings/{_seg(setting_id, 'setting_id')}", url, key
     )
@@ -712,9 +952,11 @@ def opencdr_settings_delete(setting_id: str = "global") -> dict:
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_ir_roles_list(page_size: int = 20, next_token: str | None = None) -> dict:
+def opencdr_ir_roles_list(
+    page_size: int = 20, next_token: str | None = None, agent_id: str | None = None
+) -> dict:
     """List IR role mappings (which IAM role responder assumes per AWS account). Read-only."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     query = _qs(page_size=page_size, next_token=next_token)
     status, body = opencdr._request("GET", f"/ir-roles?{query}", url, key)
     _raise_on_error(status, body, "ir-roles list")
@@ -722,10 +964,10 @@ def opencdr_ir_roles_list(page_size: int = 20, next_token: str | None = None) ->
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_ir_roles_get(aws_account_id: str) -> dict:
+def opencdr_ir_roles_get(aws_account_id: str, agent_id: str | None = None) -> dict:
     """Get the IR role mapping for a 12-digit AWS account id. Read-only."""
     _require_account_id(aws_account_id)
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     status, body = opencdr._request(
         "GET", f"/ir-roles/{_seg(aws_account_id, 'aws_account_id')}", url, key
     )
@@ -736,7 +978,13 @@ def opencdr_ir_roles_get(aws_account_id: str) -> dict:
 
 
 @_tool(CAP_IR_ROLES, annotations=_DESTRUCTIVE)
-def opencdr_ir_roles_upsert(aws_account_id: str, role_arn: str, enabled: bool = True) -> dict:
+def opencdr_ir_roles_upsert(
+    aws_account_id: str,
+    role_arn: str,
+    enabled: bool = True,
+    expected_rev: int | None = None,
+    agent_id: str | None = None,
+) -> dict:
     """Create/update the IR role mapping for an AWS account (PUT upsert).
 
     PRIVILEGED, security-sensitive: this controls which IAM role the
@@ -747,6 +995,10 @@ def opencdr_ir_roles_upsert(aws_account_id: str, role_arn: str, enabled: bool = 
     whose ARN points at a different account is refused here (and by the API)
     to prevent introducing arbitrary cross-account role assumption. Set
     enabled=False to disable a mapping without deleting it.
+
+    Pass the revision read from opencdr_ir_roles_get to reject stale changes, or
+    0 for conditional creation. When omitted, read the current revision once and
+    guard the PUT; a conflict is returned without rebasing or automatic retry.
     """
     aws_account_id = _require_account_id(aws_account_id)
     m = _ROLE_ARN_RE.match(role_arn or "")
@@ -756,8 +1008,20 @@ def opencdr_ir_roles_upsert(aws_account_id: str, role_arn: str, enabled: bool = 
         raise ValueError(
             "role_arn account does not match aws_account_id -- cross-account role mapping refused"
         )
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
+    if expected_rev is None:
+        read_status, current = opencdr._request(
+            "GET", f"/ir-roles/{_seg(aws_account_id, 'aws_account_id')}", url, key
+        )
+        if read_status == 404:
+            expected_rev = 0
+        else:
+            _raise_on_error(read_status, current, "ir-roles upsert read")
+            expected_rev = int(current.get("rev") or 0)
+    if isinstance(expected_rev, bool) or not isinstance(expected_rev, int) or expected_rev < 0:
+        raise ValueError("expected_rev must be a non-negative integer")
     payload = {"aws_account_id": aws_account_id, "role_arn": role_arn, "enabled": enabled}
+    payload["expected_rev"] = expected_rev
     status, body = opencdr._request(
         "PUT", f"/ir-roles/{_seg(aws_account_id, 'aws_account_id')}", url, key, json=payload
     )
@@ -766,14 +1030,14 @@ def opencdr_ir_roles_upsert(aws_account_id: str, role_arn: str, enabled: bool = 
 
 
 @_tool(CAP_IR_ROLES, annotations=_DESTRUCTIVE)
-def opencdr_ir_roles_delete(aws_account_id: str) -> dict:
+def opencdr_ir_roles_delete(aws_account_id: str, agent_id: str | None = None) -> dict:
     """Delete the IR role mapping for an AWS account. DESTRUCTIVE.
 
     Removing a mapping means the responder falls back to its default role for
     that account (or can no longer act in it).
     """
     aws_account_id = _require_account_id(aws_account_id)
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     status, body = opencdr._request(
         "DELETE", f"/ir-roles/{_seg(aws_account_id, 'aws_account_id')}", url, key
     )
@@ -789,9 +1053,11 @@ def opencdr_ir_roles_delete(aws_account_id: str) -> dict:
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_ir_actions_list(page_size: int = 20, next_token: str | None = None) -> dict:
+def opencdr_ir_actions_list(
+    page_size: int = 20, next_token: str | None = None, agent_id: str | None = None
+) -> dict:
     """List executed, rollback-eligible IR actions. Read-only."""
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     query = _qs(page_size=page_size, next_token=next_token)
     status, body = opencdr._request("GET", f"/ir-actions?{query}", url, key)
     _raise_on_error(status, body, "ir-actions list")
@@ -799,7 +1065,7 @@ def opencdr_ir_actions_list(page_size: int = 20, next_token: str | None = None) 
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
-def opencdr_ir_actions_get(detection_id: str) -> dict:
+def opencdr_ir_actions_get(detection_id: str, agent_id: str | None = None) -> dict:
     """Get a specific executed IR action. Read-only.
 
     Includes rollback_supported and, once a rollback has been attempted,
@@ -808,7 +1074,7 @@ def opencdr_ir_actions_get(detection_id: str) -> dict:
     rollback_status == "succeeded" for back-compat; absent rollback_status
     means no rollback has been attempted yet.
     """
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     status, body = opencdr._request(
         "GET", f"/ir-actions/{_seg(detection_id, 'detection_id')}", url, key
     )
@@ -819,7 +1085,9 @@ def opencdr_ir_actions_get(detection_id: str) -> dict:
 
 
 @_tool(CAP_IR_ACTIONS_WRITE, annotations=_ROLLBACK)
-def opencdr_ir_actions_rollback(detection_id: str, reason: str | None = None) -> dict:
+def opencdr_ir_actions_rollback(
+    detection_id: str, reason: str | None = None, agent_id: str | None = None
+) -> dict:
     """Enqueue the rollback of a specific IR action for async execution.
 
     SECURITY-SENSITIVE: this reverses an automated containment action.
@@ -838,7 +1106,7 @@ def opencdr_ir_actions_rollback(detection_id: str, reason: str | None = None) ->
     The actor identity itself is never taken from this call -- it comes from
     the authenticated API key on the server side.
     """
-    url, key = _resolve_api()
+    url, key = _resolve_api(agent_id)
     payload: dict[str, Any] = {"interface": "mcp"}
     if reason:
         payload["reason"] = reason
@@ -849,6 +1117,232 @@ def opencdr_ir_actions_rollback(detection_id: str, reason: str | None = None) ->
         return {"found": False, "detection_id": detection_id}
     _raise_on_error(status, body, "ir-actions rollback")
     return body
+
+
+# Fleet tools operate on the concentrator; Core tools above forward to an explicit agent_id.
+_REGISTRATION_FIELDS = {
+    "agent_id",
+    "name",
+    "account_id",
+    "region",
+    "stage",
+    "api_url",
+    "enabled",
+    "allow_writes",
+    "settings_ids",
+    "integration_ids",
+}
+
+
+def _fleet_client() -> FleetClient:
+    cfg = opencdr._load_config()
+    if opencdr.connection_mode(cfg) != "fleet":
+        raise OpenCDRConfigError(
+            "This tool requires fleet connection mode; restart MCP after configuring it"
+        )
+    return FleetClient(FleetConnection.from_config(cfg))
+
+
+def _fleet_call(
+    method: str, path: str, payload: dict | None = None, *, fleet_client: FleetClient | None = None,
+) -> dict:
+    active = fleet_client or _fleet_client()
+    status, body = active.verified_request(method, path, json_body=payload)
+    if status >= 300:
+        raise FleetError(f"Fleet HTTP {status}: {json.dumps(body, default=str)}")
+    if not isinstance(body, dict):
+        raise FleetError("Fleet Manager returned an unexpected response")
+    if status == 207:
+        results = body.get("results")
+        if not isinstance(results, list):
+            raise FleetError("Fleet Manager returned an invalid multi-agent result")
+        accepted = all(
+            isinstance(row, dict)
+            and isinstance(row.get("status_code"), int)
+            and 200 <= row["status_code"] < 300
+            and row.get("attempted") is True
+            and not (row.get("outcome") or row.get("error_code") or row.get("body_omitted"))
+            for row in results
+        )
+        body = {**body, "all_requests_accepted": accepted, "partial_failure": not accepted}
+    return body
+
+
+def _fleet_registration(registration: dict, agent_id: str | None = None) -> dict:
+    required = {"agent_id", "name", "account_id", "region", "stage", "api_url"}
+    if set(registration) - _REGISTRATION_FIELDS or not required <= set(registration):
+        raise ValueError("Use a complete registration document without credentials or metadata")
+    agent_identifier(registration["agent_id"])
+    if agent_id is not None and registration["agent_id"] != agent_identifier(agent_id):
+        raise ValueError("Registration agent_id does not match the requested agent")
+    return dict(registration)
+
+
+def _fleet_revision(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError("expected_rev must be a positive registration revision")
+    return value
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_status() -> dict:
+    """Verify Fleet Manager identity and read its version and deployment status. No Core calls."""
+    return _fleet_client().verify()
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_agents_list(limit: int = 20, next_token: str | None = None) -> dict:
+    """Read a page of agent identities and observed status. Follow next_token for all accounts.
+
+    Status/configuration timestamps and stale flags describe cached observations,
+    not current Core configuration or a guarantee that an evaluator is active.
+    Select the exact agent_id when calling any existing Core management tool.
+    """
+    if not 1 <= limit <= 50:
+        raise ValueError("limit must be 1–50")
+    return _fleet_call("GET", "/v1/agents?" + _qs(limit=limit, next_token=next_token))
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_agent_get(agent_id: str) -> dict:
+    """Read a registered agent's identity, forwarding permissions and cached polling health."""
+    return _fleet_call("GET", f"/v1/agents/{agent_identifier(agent_id)}")
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_configuration_get(
+    agent_id: str,
+    kind: FleetConfigKind | None = None,
+    limit: int = 20,
+    next_token: str | None = None,
+) -> dict:
+    """Read a page of a cached configuration snapshot, preserving generation and coverage metadata.
+
+    Contains redacted rule/list/notification/integration documents. Follow the
+    pinned next_token; stale or partial registered-ID coverage is not live state.
+    Use normal Core tools with agent_id for authoritative live configuration.
+    """
+    if not 1 <= limit <= 50:
+        raise ValueError("limit must be 1–50")
+    return _fleet_call(
+        "GET",
+        f"/v1/agents/{agent_identifier(agent_id)}/configuration?"
+        + _qs(kind=kind, limit=limit, next_token=next_token),
+    )
+
+
+@_tool(CAP_FLEET_REFRESH, annotations=_REPLAY, fleet_only=True)
+def opencdr_fleet_agent_refresh(agent_id: str) -> dict:
+    """Queue a read-only poll. Inspect observation times to confirm completion."""
+    return _fleet_call("POST", f"/v1/agents/{agent_identifier(agent_id)}/refresh")
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_RELEASE, fleet_only=True)
+def opencdr_fleet_agent_register(registration: dict) -> dict:
+    """Register a reviewed Core agent. Requires administrator profile and fleet IAM registry access.
+
+    Keys must already exist in fleet SSM; this tool accepts no credentials and
+    creates no AWS users, roles or keys. Use opencdr-deploy for credential setup.
+    Start with allow_writes=false. Core remains the execution authority.
+    """
+    return _fleet_call("POST", "/v1/agents", _fleet_registration(registration))
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_DESTRUCTIVE, fleet_only=True)
+def opencdr_fleet_agent_update(agent_id: str, registration: dict, expected_rev: int) -> dict:
+    """Replace agent registration with an explicit revision guard. No conflict retries.
+
+    Changing endpoint, enablement or allow_writes affects forwarding access.
+    Review all fields. Account/region/stage immutability is enforced by Fleet Manager.
+    """
+    payload = _fleet_registration(registration, agent_id)
+    payload["expected_rev"] = _fleet_revision(expected_rev)
+    return _fleet_call("PUT", f"/v1/agents/{agent_identifier(agent_id)}", payload)
+
+
+def _fleet_agent_enabled(agent_id: str, expected_rev: int, enabled: bool) -> dict:
+    expected_rev = _fleet_revision(expected_rev)
+    active = _fleet_client()
+    path = f"/v1/agents/{agent_identifier(agent_id)}"
+    result = _fleet_call("GET", path, fleet_client=active)
+    current = result.get("agent")
+    if not isinstance(current, dict) or current.get("rev") != expected_rev:
+        raise FleetError("Registration revision changed; inspect the agent and review again")
+    payload = {key: value for key, value in current.items() if key in _REGISTRATION_FIELDS}
+    payload["enabled"] = enabled
+    payload = _fleet_registration(payload, agent_id)
+    payload["expected_rev"] = expected_rev
+    return _fleet_call("PUT", path, payload, fleet_client=active)
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_DESTRUCTIVE, fleet_only=True)
+def opencdr_fleet_agent_disable(agent_id: str, expected_rev: int) -> dict:
+    """Disable polling/forwarding, retaining registry and observations. Keys remain issued."""
+    return _fleet_agent_enabled(agent_id, expected_rev, False)
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_DESTRUCTIVE, fleet_only=True)
+def opencdr_fleet_agent_enable(agent_id: str, expected_rev: int) -> dict:
+    """Enable polling/forwarding using a reviewed registration revision. Security-sensitive."""
+    return _fleet_agent_enabled(agent_id, expected_rev, True)
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_read(agent_ids: list[str], path: str, query: dict | None = None) -> dict:
+    """GET fan-out to 1–8 agents. Preserve target statuses, omissions and errors.
+
+    HTTP 207 is not overall success. Requests are not atomic. Omitted bodies need
+    individual reads. Core remains authoritative; this is not a fleet state mutation.
+    """
+    if not 1 <= len(agent_ids) <= 8 or len(set(agent_ids)) != len(agent_ids):
+        raise ValueError("Choose 1–8 unique agent IDs")
+    payload = {
+        "agent_ids": [agent_identifier(value) for value in agent_ids],
+        "method": "GET",
+        "path": relative_path(path, "/"),
+        "query": query or {},
+    }
+    return _fleet_call("POST", "/v1/fleet/read", payload)
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_RELEASE, fleet_only=True)
+def opencdr_fleet_invoke(
+    agent_ids: list[str],
+    method: Literal["POST", "PUT", "DELETE"],
+    path: str,
+    body: dict | None = None,
+    query: dict | None = None,
+) -> dict:
+    """Non-atomic multi-agent write with administrator, IAM and agent write access.
+
+    No automatic retries or rollback. Preserve per-agent partial/unknown outcomes.
+    Different revisions usually require individual Core tools with agent_id instead.
+    Never interpret API acceptance as evaluator activation.
+    """
+    if not 1 <= len(agent_ids) <= 8 or len(set(agent_ids)) != len(agent_ids):
+        raise ValueError("Choose 1–8 unique agent IDs")
+    payload = {
+        "agent_ids": [agent_identifier(value) for value in agent_ids],
+        "method": method,
+        "path": relative_path(path, "/"),
+        "query": query or {},
+        "body": body,
+    }
+    return _fleet_call("POST", "/v1/fleet/invoke", payload)
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_RELEASE, fleet_only=True)
+def opencdr_fleet_request(
+    method: Literal["GET", "POST", "PUT", "DELETE"],
+    path: str,
+    body: dict | None = None,
+) -> dict:
+    """Administrator-only access to the complete Fleet Manager API, including future routes.
+
+    This broad tool can mutate registry or forward Core writes. Prefer typed tools.
+    No retries; inspect every partial/uncertain result. Paths must start with /v1/.
+    """
+    return _fleet_call(method, relative_path(path), body)
 
 
 def main() -> None:

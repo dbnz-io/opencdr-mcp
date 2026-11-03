@@ -238,7 +238,8 @@ concurrency controls where the API supports them.
 
 Core is authoritative for validation, configuration revisions and execution
 results. Validation/evaluation and release planning do not change deployed rules,
-but require the Core `rules` scope and the `operator` or `responder` profile.
+but require the Core `rules` scope and the `operator`, `responder` or
+`administrator` profile.
 Release application can disable or delete managed rules; inspect its plan first.
 Core recomputes the release diff at apply time, so a prior plan is not a frozen
 approval token. A partial conflict can follow completed writes; the tool error
@@ -251,11 +252,11 @@ not completion, and an ambiguous response must not be retried blindly. IR-role
 updates accept `expected_rev`; when omitted, the tool reads a revision once and
 guards its write without retrying a conflict.
 
-This package manages agents through the Core API. Platform-owned incident cases,
-assignments, triage and approvals are outside that contract. Fleet-manager and
-direct AWS operations are not implemented by this release; a future optional
-fleet connection will retain direct Core access. Capability profiles reduce
-tools, not backend authorization or a customer's independent direct access.
+This package manages agents through the Core API, directly or through the
+optional Fleet Manager connection. Platform-owned incident cases, assignments,
+triage and approvals are outside that contract. Direct AWS provisioning and
+recovery use OpenCDR Deploy. Capability profiles reduce tools, not backend
+authorization or a customer's independent direct access.
 
 ## Development
 
@@ -272,7 +273,7 @@ python -m twine check dist/*
 ## Releases
 
 GitHub releases publish to PyPI through trusted publishing. The release tag must
-exactly match `v<project.version>`, for example `v0.1.0`. The `pypi` GitHub
+exactly match `v<project.version>`, for example `v0.2.0`. The `pypi` GitHub
 environment and the PyPI trusted publisher must be configured before publishing
 the first release; no long-lived PyPI token is stored in GitHub.
 

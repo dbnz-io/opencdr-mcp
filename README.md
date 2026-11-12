@@ -1,5 +1,9 @@
 # OpenCDR MCP
 
+The [durable detection feed tool](docs/detection-feed.md) reads signals and
+correlated alerts from IAM-enabled Core 2.1 management contracts, directly or
+through a selected Fleet agent. It does not acknowledge or centrally index them.
+
 `opencdr-mcp` exposes the OpenCDR management API as tools for MCP-compatible
 clients. It is an optional client integration: OpenCDR Core detects and responds
 to events without this package.
@@ -7,6 +11,12 @@ to events without this package.
 The server uses stdio transport. It connects directly to one Core agent, or to an
 optional [Fleet Manager](https://github.com/dbnz-io/opencdr-fleet-manager) for
 multiple accounts. It requires no Core or Fleet Manager source checkout.
+
+Version **0.3.0** adds direct Core IAM connections, scoped Fleet management,
+revision-guarded changes and reviewed durable rollouts. Start with the
+[IAM connection guide](docs/iam-connections.md) for the new management model.
+It requires a Core release advertising the IAM management capabilities and
+Fleet Manager **0.2.0+**. Older API-key connections remain a migration option.
 
 ## Install
 
@@ -53,7 +63,7 @@ The MCP reads only the chosen fleet entry from
 custom CLI registry. The CLI package is not needed at MCP runtime. For a restricted
 MCP identity, set `OPENCDR_FLEET_AWS_PROFILE` to your dedicated reader/operator AWS
 profile instead of inheriting the administrative deployment profile. AWS IAM and
-the agent's scoped keys enforce access; MCP profiles reduce tool exposure.
+Core's management permissions enforce access; MCP profiles reduce tool exposure.
 
 Claude Code example:
 
@@ -121,6 +131,7 @@ concurrent calls keep their own agent identity and credentials.
 
 | Profile | Fleet capabilities, in addition to its Core tools |
 |---|---|
+| `triage` | Read tools plus detection handling and operational case updates; no configuration or response operations |
 | `observer` | Manager status, paginated agent inventory, individual agent state, cached configuration, explicit GET fan-out |
 | `operator` | Observer fleet reads plus queueing a fresh poll |
 | `responder` | Operator fleet operations and existing Core IR-role/rollback tools |
@@ -210,6 +221,7 @@ opencdr-mcp
 
 | Profile | Exposed operations |
 |---|---|
+| `triage` | Read tools plus status/disposition/assignment/manual SIEM-reference edits with revision and request guards |
 | `observer` | Read status, rules, lists, signals, logs, settings, integrations, IR roles and IR actions |
 | `operator` | Observer operations plus rule/list, integration and settings changes |
 | `responder` | Operator operations plus IR-role changes and IR-action rollback |
@@ -280,3 +292,84 @@ the first release; no long-lived PyPI token is stored in GitHub.
 ## License
 
 Mozilla Public License 2.0. See [LICENSE](LICENSE).
+
+### Retained detections and reviewed recovery (local source)
+
+`opencdr_detection_backfill_status` reads a job or pages its outcomes.
+`opencdr_detection_backfill_update` plans or advances a bounded import and requires
+an administrator profile plus Core administrator access (including the selected
+agent's write permission in Fleet mode). It preserves source IDs and does not
+re-evaluate detections or replay external effects. Retained-source scans do not
+prove complete history.
+
+For direct delivery consumers, `opencdr_detection_consumer_reconcile` requires a
+completed job/digest, current revision, reason, unique request ID and explicit
+`accept_unrecoverable=true`; consumer status supports `audit=true` pagination.
+Fleet operators instead use administrator-only `opencdr_fleet_detection_reconcile`
+with exact checkpoint generation and registration revision. The original worker
+performs recovery; acceptance is not completion. Inspect Fleet detection status.
+See the workspace Core `docs/detection-backfill.md` procedure. These operations
+are not yet published or live-accepted; replacement-role and combined recovery
+remain unfinished.
+
+Detection handling and triage access: see [operator notes](docs/detection-handling.md).
+
+## Operational cases (P2 candidate)
+
+The local candidate adds shared operational cases: Core owns standalone cases,
+Fleet owns multi-account cases. Read `capabilities.operational_cases == "1.0.0"`
+before using `/cases` (Core) or `/v1/cases` (Fleet). Create, edit, notes, verified
+attachments, retained evidence, close/reopen and immutable history use IAM,
+revision checks and stable request IDs. Cases track SIEM work; they do not run
+investigations or change detection handling. Fleet requires explicit principal
+account grants, even for administrators, and never fans out case reads to Core.
+
+Use the [owner deployment/test and KPI guide](https://github.com/dbnz-io/opencdr/blob/main/docs/operational-cases.md) for grants, Deploy commands,
+limits, failure scenarios and remaining live/retention/migration gates. This
+candidate is locally tested; it has not been deployed or publicly promoted.
+
+New tools: `opencdr_cases_list` and `opencdr_case_read` are read-only;
+`opencdr_case_mutate` requires the triage profile or higher.
+`opencdr_fleet_case_access` requires Fleet administrator authority. These case
+tools use the configured case owner directly in both modes. They do not accept a
+member proxy selector; attachment payloads identify their source agent explicitly.
+
+### P2 case and execution additions (candidate)
+
+- `opencdr_case_active`: read the accessible active case for a detection and full
+  selected account scope. Fleet stays the case authority.
+- `opencdr_case_integration`: administrator-only trust binding/read for a dedicated
+  connector role. This does not fetch vendor status or impersonate a connector.
+- `opencdr_response_outcomes`: bounded response/rollback observations and immutable
+  attempt history; in Fleet mode it forwards only to the selected Core.
+
+Connector reports use Deploy with dedicated `integration` IAM access, not human
+MCP profiles. Outcomes can be unknown or partially failed; they do not authorize
+replay. New workers preserve original dry-run mode and block legacy rollback
+records whose original mode is unknown. See the coordinated Core guide
+`docs/case-connectors-and-outcomes.md` before upgrading workers.
+
+## Engine content library (P3 local candidate)
+
+`opencdr_library_read` reads items, versions, verified stored artifacts, history
+and frozen snapshots. `opencdr_library_write` creates items, changes metadata or
+archive state, saves immutable versions and freezes declared dependency pins.
+The read tool is available to observers; writing requires the rules/operator
+capability. Core requires IAM and `content_library: 1.0.0`. In Fleet mode these
+are central owner operations without an agent selector or member-Core fallback.
+
+Every write needs a stable request ID and reason; item updates/version saves
+also require the current revision. Unknown outcomes must be retried unchanged.
+Saved versions are unvalidated; import metadata is caller-declared. These tools
+never fetch Git, approve, deploy or execute rules. See the coordinated
+[library manual](https://github.com/dbnz-io/opencdr/blob/main/docs/content-library.md). Hosted SaaS MCP and
+assistant migration remain separate roadmap work.
+
+### P4–P6 local candidate (2026-11-11)
+
+Owner review registry/inbox/decisions and owner-local routing previews are now
+implemented locally. Fleet also negotiates complete saved-profile/binding
+inventory with compatible Core agents. These changes are undeployed and are not
+approval-enforced jobs or automatic case routing. See the coordinated
+[implementation and CLI guide](https://github.com/dbnz-io/opencdr/blob/main/docs/p4-p6-local-implementation-2026-11-11.md)
+for capabilities, limits, evidence and remaining acceptance gates.

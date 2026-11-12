@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opencdr-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP management server for OpenCDR Core"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -52,6 +52,7 @@ packages = ["src/opencdr_mcp"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100

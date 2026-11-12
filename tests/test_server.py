@@ -83,6 +83,41 @@ class TestSettingsGet:
         assert mock_req.call_args.args[1] == "/settings/global"
 
 
+class TestDetectionFeed:
+    def test_reads_one_page_without_acknowledgement_or_cursor_reset(self, api_env):
+        with patch.object(
+            opencdr, "_request", return_value=(200, {"items": [], "next_cursor": "next"})
+        ) as request:
+            assert server.opencdr_detections_feed(cursor="a/b+=", limit=20)["next_cursor"] == "next"
+        assert request.call_count == 1
+        assert request.call_args.args[:2] == ("GET", "/detections/feed?cursor=a%2Fb%2B%3D&limit=20")
+
+    @pytest.mark.parametrize(
+        "input",
+        [
+            {"limit": 0},
+            {"limit": True},
+            {"limit": 101},
+            {"cursor": ""},
+            {"cursor": "a" * 513},
+            {"cursor": "a", "start": "latest"},
+            {"start": "reset"},
+        ],
+    )
+    def test_rejects_invalid_bounds_before_connecting(self, input):
+        with patch.object(server, "_resolve_api") as resolve, pytest.raises(ValueError):
+            server.opencdr_detections_feed(**input)
+        resolve.assert_not_called()
+
+    def test_retention_gap_is_not_hidden_by_reset_or_retry(self, api_env):
+        with patch.object(
+            opencdr, "_request", return_value=(410, {"error_code": "retention_gap"})
+        ) as request:
+            with pytest.raises(RuntimeError, match="410"):
+                server.opencdr_detections_feed(cursor="old")
+        assert request.call_count == 1
+
+
 class TestSettingsSet:
     def test_merges_new_channel_into_existing(self, api_env):
         def fake_request(method, path, url, key, **kwargs):
@@ -520,11 +555,15 @@ class TestIrRolesGet:
 
 class TestIrRolesUpsert:
     def test_builds_correct_payload(self, api_env):
-        with patch.object(opencdr, "_request", return_value=(200, {"ok": True})) as mock_req:
+        with patch.object(
+            opencdr,
+            "_request",
+            return_value=(200, {"ok": True, "capabilities": {"ir_role_revision_guards": True}}),
+        ) as mock_req:
             server.opencdr_ir_roles_upsert(
                 "123456789012", "arn:aws:iam::123456789012:role/IR", expected_rev=3
             )
-        mock_req.assert_called_once_with(
+        mock_req.assert_called_with(
             "PUT",
             "/ir-roles/123456789012",
             "https://api.example.com",
@@ -538,7 +577,11 @@ class TestIrRolesUpsert:
         )
 
     def test_enabled_false_passed_through(self, api_env):
-        with patch.object(opencdr, "_request", return_value=(200, {"ok": True})) as mock_req:
+        with patch.object(
+            opencdr,
+            "_request",
+            return_value=(200, {"ok": True, "capabilities": {"ir_role_revision_guards": True}}),
+        ) as mock_req:
             server.opencdr_ir_roles_upsert(
                 "123456789012", "arn:aws:iam::123456789012:role/IR", enabled=False
             )

@@ -6,10 +6,11 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 
+from .core import CoreTarget
 from .fleet import FleetTarget
 
 
@@ -36,8 +37,9 @@ def _load_config() -> dict[str, Any]:
 def _request(
     method: str, path: str, url: str, key: str | FleetTarget, **kwargs: Any
 ) -> tuple[int, Any]:
-    if isinstance(key, FleetTarget):
+    if isinstance(key, (FleetTarget, CoreTarget)):
         return key.request(method, path, **kwargs)
+    url = normalize_url(url)
     headers = {"x-api-key": key, "Content-Type": "application/json"}
     response = requests.request(
         method, f"{url}{path}", headers=headers, timeout=15, allow_redirects=False, **kwargs
@@ -97,3 +99,41 @@ def connection_mode(config: dict[str, Any] | None = None) -> str:
     if mode not in {"core", "fleet"}:
         raise ValueError("OPENCDR_CONNECTION_MODE/mode must be core or fleet")
     return mode
+
+
+def normalize_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.port not in {None, 443}
+        ):
+            raise ValueError("Core URL must use HTTPS without credentials, query or fragment")
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Core URL must use HTTPS without credentials, query or fragment"
+        ) from error
+    return value.rstrip("/")
+
+
+def verify_identity(url: str, key: str, expected: dict) -> None:
+    if (
+        not isinstance(expected, dict)
+        or not expected
+        or set(expected) - {"account_id", "home_region", "stage"}
+        or any(not isinstance(value, str) or not value for value in expected.values())
+    ):
+        raise ValueError("deployment must contain account_id, home_region and/or stage")
+    status, report = _request("GET", "/status", url, key)
+    identity = report.get("deployment", {}) if isinstance(report, dict) else {}
+    if (
+        status != 200
+        or not isinstance(identity, dict)
+        or any(identity.get(name) != value for name, value in expected.items())
+    ):
+        raise ValueError("Core deployment identity mismatch; no operation sent")

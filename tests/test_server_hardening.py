@@ -29,6 +29,43 @@ def api_env(monkeypatch):
 
 # (tool function, expected readOnly, expected destructive, expected idempotent)
 _ANNOTATION_MATRIX = [
+    ("opencdr_case_extensions", True, False, True),
+    ("opencdr_case_extension_save", False, False, True),
+    ("opencdr_configuration_flags", True, False, True),
+    ("opencdr_configuration_ownership", True, False, True),
+    ("opencdr_routing_drain", False, False, True),
+    ("opencdr_case_tuning_draft", False, False, True),
+    ("opencdr_library_read", True, False, True),
+    ("opencdr_reviews_read", True, False, True),
+    ("opencdr_review_decide", False, False, True),
+    ("opencdr_review_propose", False, False, True),
+    ("opencdr_review_execute", False, True, False),
+    ("opencdr_review_execution", True, False, True),
+    ("opencdr_review_cancel", False, False, True),
+    ("opencdr_routing_activate", False, True, False),
+    ("opencdr_routing_activation", True, False, True),
+    ("opencdr_case_routing_preview", True, False, True),
+    ("opencdr_library_evidence", True, False, True),
+    ("opencdr_library_runtime_source", True, False, True),
+    ("opencdr_library_quality", False, False, True),
+    ("opencdr_library_write", False, False, True),
+    ("opencdr_case_active", True, False, True),
+    ("opencdr_response_outcomes", True, False, True),
+    ("opencdr_case_integration", False, True, True),
+    ("opencdr_cases_list", True, False, True),
+    ("opencdr_case_read", True, False, True),
+    ("opencdr_case_mutate", False, False, True),
+    ("opencdr_detection_handling", True, False, True),
+    ("opencdr_detection_handling_update", False, False, True),
+    ("opencdr_detection_recovery_status", True, False, True),
+    ("opencdr_detection_recovery_update", False, True, True),
+    ("opencdr_detection_consumer_recover", False, True, True),
+    ("opencdr_detection_handoff_status", True, False, True),
+    ("opencdr_detection_handoff_plan", False, False, True),
+    ("opencdr_detection_handoff_accept", False, True, True),
+    ("opencdr_detection_backfill_status", True, False, True),
+    ("opencdr_detection_backfill_update", False, False, False),
+    ("opencdr_detection_consumer_reconcile", False, True, True),
     ("opencdr_integrations_get", True, False, True),
     ("opencdr_integrations_put", False, False, True),
     ("opencdr_integrations_preview", False, False, True),
@@ -46,6 +83,11 @@ _ANNOTATION_MATRIX = [
     ("opencdr_lists_list", True, False, True),
     ("opencdr_lists_show", True, False, True),
     ("opencdr_signals_search", True, False, True),
+    ("opencdr_detections_feed", True, False, True),
+    ("opencdr_detection_consumer_status", True, False, True),
+    ("opencdr_detection_consumer_update", False, False, False),
+    ("opencdr_detections_query", True, False, True),
+    ("opencdr_detection_detail", True, False, True),
     ("opencdr_signals_stats", True, False, True),
     ("opencdr_logs_search", True, False, True),
     ("opencdr_settings_get", True, False, True),
@@ -97,6 +139,27 @@ def test_registered_tools_carry_annotations():
 # ---------------------------------------------------------------------------
 
 _READ_TOOLS = {
+    "opencdr_case_extensions",
+    "opencdr_configuration_flags",
+    "opencdr_configuration_ownership",
+    "opencdr_reviews_read",
+    "opencdr_review_execution",
+    "opencdr_routing_activation",
+    "opencdr_library_evidence",
+    "opencdr_library_runtime_source",
+    "opencdr_library_read",
+    "opencdr_case_active",
+    "opencdr_response_outcomes",
+    "opencdr_cases_list",
+    "opencdr_case_read",
+    "opencdr_detection_handling",
+    "opencdr_detection_recovery_status",
+    "opencdr_detection_handoff_status",
+    "opencdr_detection_backfill_status",
+    "opencdr_detection_consumer_status",
+    "opencdr_detections_feed",
+    "opencdr_detections_query",
+    "opencdr_detection_detail",
     "opencdr_integrations_get",
     "opencdr_status",
     "opencdr_rules_list",
@@ -116,6 +179,21 @@ _READ_TOOLS = {
     "opencdr_ir_actions_get",
 }
 _RULES_SETTINGS_WRITE = {
+    "opencdr_case_extension_save",
+    "opencdr_routing_drain",
+    "opencdr_case_tuning_draft",
+    "opencdr_review_decide",
+    "opencdr_review_propose",
+    "opencdr_review_execute",
+    "opencdr_review_cancel",
+    "opencdr_routing_activate",
+    "opencdr_case_routing_preview",
+    "opencdr_library_quality",
+    "opencdr_library_write",
+    "opencdr_case_mutate",
+    "opencdr_detection_handling_update",
+    "opencdr_detection_consumer_reconcile",
+    "opencdr_detection_consumer_update",
     "opencdr_rules_validate",
     "opencdr_rules_evaluate",
     "opencdr_rule_releases_plan",
@@ -275,9 +353,19 @@ def test_ir_role_upsert_rejects_cross_account_arn(api_env):
 
 
 def test_ir_role_upsert_accepts_matching_arn(api_env):
-    with patch.object(opencdr, "_request", return_value=(200, {"ok": True})) as mock_req:
+    with patch.object(
+        opencdr,
+        "_request",
+        return_value=(
+            200,
+            {
+                "ok": True,
+                "capabilities": {"ir_role_revision_guards": True},
+            },
+        ),
+    ) as mock_req:
         server.opencdr_ir_roles_upsert("123456789012", "arn:aws:iam::123456789012:role/IR")
-    assert mock_req.call_count == 2
+    assert mock_req.call_count == 3
     assert mock_req.call_args.kwargs["json"]["expected_rev"] == 0
 
 

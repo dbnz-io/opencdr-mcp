@@ -108,16 +108,19 @@ CAP_IR_ROLES = "ir_roles"
 CAP_IR_ACTIONS_WRITE = "ir_actions"
 CAP_FLEET_REFRESH = "fleet_refresh"
 CAP_FLEET_ADMIN = "fleet_admin"
+CAP_MAINTENANCE = "maintenance"
+CAP_TRIAGE = "triage"
 
 _OBSERVER_CAPS = frozenset({CAP_READ})
-_OPERATOR_CAPS = _OBSERVER_CAPS | {CAP_RULES, CAP_SETTINGS, CAP_FLEET_REFRESH}
+_OPERATOR_CAPS = _OBSERVER_CAPS | {CAP_TRIAGE, CAP_RULES, CAP_SETTINGS, CAP_FLEET_REFRESH}
 _RESPONDER_CAPS = _OPERATOR_CAPS | {CAP_IR_ROLES, CAP_IR_ACTIONS_WRITE}
 
 _PROFILE_CAPS: dict[str, frozenset[str]] = {
     "observer": _OBSERVER_CAPS,
+    "triage": _OBSERVER_CAPS | {CAP_TRIAGE},
     "operator": _OPERATOR_CAPS,
     "responder": _RESPONDER_CAPS,
-    "administrator": _RESPONDER_CAPS | {CAP_FLEET_ADMIN},
+    "administrator": _RESPONDER_CAPS | {CAP_FLEET_ADMIN, CAP_MAINTENANCE},
 }
 
 
@@ -132,17 +135,27 @@ _ACTIVE_CAPS = _PROFILE_CAPS[PROFILE]
 # tool name -> required capability, populated by @_tool at import time.
 _TOOL_CAPS: dict[str, str] = {}
 _FLEET_TOOL_CAPS: dict[str, str] = {}
+_CORE_ONLY_TOOLS: set[str] = set()
 
 
 def allowed_tools(profile: str, mode: str = "core") -> set[str]:
     """Names of the tools a given profile may discover/call. Pure policy."""
     caps = _PROFILE_CAPS.get(profile, _OBSERVER_CAPS)
     catalog = {**_TOOL_CAPS, **(_FLEET_TOOL_CAPS if mode == "fleet" else {})}
-    return {name for name, cap in catalog.items() if cap in caps}
+    return {
+        name
+        for name, cap in catalog.items()
+        if cap in caps and (mode != "fleet" or name not in _CORE_ONLY_TOOLS)
+    }
 
 
 def _tool(
-    cap: str, *, annotations: ToolAnnotations, fleet_only: bool = False
+    cap: str,
+    *,
+    annotations: ToolAnnotations,
+    fleet_only: bool = False,
+    central: bool = False,
+    core_only: bool = False,
 ) -> Callable[[Callable], Callable]:
     """Register a FastMCP tool only if the active profile grants `cap`.
 
@@ -153,15 +166,27 @@ def _tool(
 
     def deco(fn: Callable) -> Callable:
         (_FLEET_TOOL_CAPS if fleet_only else _TOOL_CAPS)[fn.__name__] = cap
+        if core_only:
+            _CORE_ONLY_TOOLS.add(fn.__name__)
         if not fleet_only:
-            fn.__doc__ = (
-                fn.__doc__ or ""
-            ) + "\n\nIn fleet mode, supply agent_id explicitly. Core mode leaves agent_id unset."
+            fn.__doc__ = (fn.__doc__ or "") + (
+                "\n\nStandalone Core only; Fleet uses reviewed distribution jobs."
+                if core_only
+                else "\n\nIn fleet mode this tool uses the Fleet authority directly; "
+                "Core mode uses standalone Core."
+                if central or core_only
+                else "\n\nIn fleet mode, supply agent_id explicitly. "
+                "Core mode leaves agent_id unset."
+            )
         # Stash for introspection/testing so the classification can be
         # asserted regardless of which profile happens to be active.
         fn._mcp_capability = cap  # type: ignore[attr-defined]
         fn._mcp_annotations = annotations  # type: ignore[attr-defined]
-        if cap in _ACTIVE_CAPS and (not fleet_only or opencdr.connection_mode() == "fleet"):
+        if (
+            cap in _ACTIVE_CAPS
+            and (not fleet_only or opencdr.connection_mode() == "fleet")
+            and (not core_only or opencdr.connection_mode() != "fleet")
+        ):
             mcp.tool(annotations=annotations)(fn)
         return fn
 
@@ -219,6 +244,8 @@ def _resolve_api(agent_id: str | None = None) -> tuple[str, str | FleetTarget]:
         raise OpenCDRConfigError(
             "agent_id requires fleet mode; this server is configured for direct Core access"
         )
+    if cfg.get("auth_mode") == "iam":
+        return cfg["url"], opencdr.CoreTarget(cfg)
     url = os.getenv("OPENCDR_API_URL") or cfg.get("url", "")
     key = os.getenv("OPENCDR_API_KEY") or cfg.get("key", "")
     missing = [
@@ -229,13 +256,23 @@ def _resolve_api(agent_id: str | None = None) -> tuple[str, str | FleetTarget]:
             f"Missing config: {', '.join(missing)}. Set OPENCDR_API_URL/OPENCDR_API_KEY "
             "or provide an OPENCDR_CONFIG_FILE JSON document."
         )
-    return url.rstrip("/"), key
+    url = opencdr.normalize_url(url)
+    if "deployment" in cfg:
+        opencdr.verify_identity(url, key, cfg["deployment"])
+    return url, key
 
 
 def _raise_on_error(status: int, body: Any, context: str) -> None:
     if status >= 300:
         msg = body.get("message", body) if isinstance(body, dict) else body
         raise RuntimeError(f"{context}: HTTP {status} — {msg}")
+
+
+def _require_capability(url, key, capability):
+    code, report = opencdr._request("GET", "/status", url, key)
+    _raise_on_error(code, report, "Core capability check")
+    if not isinstance(report, dict) or report.get("capabilities", {}).get(capability) is not True:
+        raise RuntimeError(f"Core does not advertise {capability}; upgrade before this write")
 
 
 def _qs(**params: Any) -> str:
@@ -420,8 +457,9 @@ def opencdr_rule_releases_apply(manifest: dict, agent_id: str | None = None) -> 
 
     Core validates the manifest and guards writes by revision. There is no
     cross-record transaction: inspect partial failure before retrying. Core
-    replans against current state at apply time; a previous plan is not a frozen
-    diff. Poll opencdr_rules_runtime_status after acceptance until verified.
+    rejects stale reviewed plans when manifest.expected_plan_digest is supplied.
+    IAM mode requires that digest from opencdr_rule_releases_plan.
+    Poll opencdr_rules_runtime_status after acceptance until verified.
     """
     url, key = _resolve_api(agent_id)
     status, body = opencdr._request("POST", "/rule-releases/apply", url, key, json=manifest)
@@ -468,13 +506,15 @@ def opencdr_rules_upsert(
 
 
 @_tool(CAP_RULES, annotations=_DESTRUCTIVE)
-def opencdr_rules_delete(rule_id: str, kind: RuleKind, agent_id: str | None = None) -> dict:
+def opencdr_rules_delete(
+    rule_id: str, kind: RuleKind, agent_id: str | None = None, expected_rev: int | None = None
+) -> dict:
     """Delete a rule by id. DESTRUCTIVE and irreversible.
 
     kind must be "signal" or "correlation".
     """
     url, key = _resolve_api(agent_id)
-    query = _qs(rule_kind=kind)
+    query = _qs(rule_kind=kind, expected_rev=expected_rev)
     status, body = opencdr._request(
         "DELETE", f"/rules/{_seg(rule_id, 'rule_id')}?{query}", url, key
     )
@@ -622,10 +662,18 @@ def opencdr_lists_remove(list_id: str, value: str, agent_id: str | None = None) 
 
 
 @_tool(CAP_RULES, annotations=_DESTRUCTIVE)
-def opencdr_lists_delete(list_id: str, agent_id: str | None = None) -> dict:
+def opencdr_lists_delete(
+    list_id: str, agent_id: str | None = None, expected_rev: int | None = None
+) -> dict:
     """Delete a list entirely. DESTRUCTIVE and irreversible."""
     url, key = _resolve_api(agent_id)
-    status, body = opencdr._request("DELETE", f"/lists/{_seg(list_id, 'list_id')}", url, key)
+    status, body = opencdr._request(
+        "DELETE",
+        f"/lists/{_seg(list_id, 'list_id')}"
+        + ("?" + _qs(expected_rev=expected_rev) if expected_rev is not None else ""),
+        url,
+        key,
+    )
     if status == 404:
         return {"found": False, "list_id": list_id}
     _raise_on_error(status, body, "lists delete")
@@ -645,6 +693,1413 @@ def opencdr_lists_delete(list_id: str, agent_id: str | None = None) -> dict:
 # date_from/date_to apply only to the day-bucketed selector (severity /
 # service).
 # ---------------------------------------------------------------------------
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_detections_feed(
+    cursor: str | None = None,
+    limit: int = 100,
+    start: str = "earliest",
+    agent_id: str | None = None,
+) -> dict:
+    """Read a bounded page of signals and correlated alerts in durable commit order.
+
+    Requires an IAM Core connection advertising detection_feed 1.x. In Fleet
+    mode select one agent_id; this forwards a read, not a fleet-wide central
+    search. Reading does not acknowledge delivery. Retention gaps are returned
+    as errors; never silently reset a cursor. start=latest deliberately skips
+    retained records and cannot be combined with a cursor.
+    """
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("limit must be an integer from 1 to 100")
+    if start not in {"earliest", "latest"}:
+        raise ValueError("start must be earliest or latest")
+    if cursor is not None and (not isinstance(cursor, str) or not 1 <= len(cursor) <= 512):
+        raise ValueError("cursor must be a nonempty feed cursor of at most 512 characters")
+    if cursor and start != "earliest":
+        raise ValueError("Specify either cursor or start=latest")
+    url, key = _resolve_api(agent_id)
+    query = _qs(cursor=cursor, limit=limit, start=start if not cursor else None)
+    status, body = opencdr._request("GET", f"/detections/feed?{query}", url, key)
+    _raise_on_error(status, body, "detections feed")
+    return body
+
+
+def _consumer_target(consumer_id, agent_id):
+    if not isinstance(consumer_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", consumer_id):
+        raise ValueError("Invalid consumer_id")
+    config = opencdr._load_config()
+    if opencdr.connection_mode(config) == "fleet" or agent_id is not None:
+        raise ValueError("Fleet mode owns its worker receipts; use Fleet detection status")
+    if config.get("auth_mode") != "iam" or config.get("access") != "delivery":
+        raise ValueError("Consumer operations require a direct Core IAM delivery connection")
+    return _resolve_api()
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_detection_consumer_status(
+    consumer_id: str,
+    agent_id: str | None = None,
+    audit: bool = False,
+    after: str | None = None,
+    limit: int = 50,
+) -> dict:
+    """Read this IAM principal's consumer receipt and lag without acknowledging.
+
+    Requires direct Core IAM delivery access. Fleet mode owns its worker receipts;
+    inspect Fleet agent detection status instead. Names never select another owner.
+    """
+    url, key = _consumer_target(consumer_id, agent_id)
+    if type(limit) is not int or not 1 <= limit <= 100 or (after is not None and not audit):
+        raise ValueError("Audit pagination requires audit=true and limit 1–100")
+    path = f"/detections/consumers/{consumer_id}"
+    if audit:
+        path += "/reconciliations?" + _qs(after=after, limit=limit)
+    code, body = opencdr._request("GET", path, url, key)
+    _raise_on_error(code, body, "detection consumer status")
+    return body
+
+
+@_tool(CAP_SETTINGS, annotations=_REPLAY)
+def opencdr_detection_consumer_update(
+    consumer_id: str,
+    action: str,
+    expected_rev: int | None = None,
+    receipt_id: str | None = None,
+    limit: int = 20,
+    initial_cursor: str | None = None,
+    checkpoint_sha256: str | None = None,
+    agent_id: str | None = None,
+) -> dict:
+    """Register, read, or acknowledge this principal's durable delivery consumer.
+
+    A read creates/replays an outstanding receipt; ACK only after durable storage.
+    Read may acknowledge the previous receipt and offer the next page in one call.
+    Registration optionally declares an existing durable checkpoint and its digest;
+    it cannot reset an existing consumer. After uncertain outcomes inspect status.
+    Requires direct Core IAM delivery access. Fleet mode manages its own receipts.
+    """
+    if action not in {"register", "read", "ack"}:
+        raise ValueError("action must be register, read or ack")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("limit must be 1–100")
+    body = {}
+    if action == "register":
+        if expected_rev is not None or receipt_id is not None:
+            raise ValueError("Registration cannot acknowledge or reset a consumer")
+        if (initial_cursor is None) != (checkpoint_sha256 is None):
+            raise ValueError("Import requires initial_cursor and checkpoint_sha256")
+        if initial_cursor is not None:
+            if (
+                not isinstance(initial_cursor, str)
+                or not 1 <= len(initial_cursor) <= 512
+                or not isinstance(checkpoint_sha256, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", checkpoint_sha256)
+            ):
+                raise ValueError("Invalid declared checkpoint")
+            body = {"initial_cursor": initial_cursor, "checkpoint_sha256": checkpoint_sha256}
+    else:
+        if (
+            type(expected_rev) is not int
+            or expected_rev < 1
+            or initial_cursor is not None
+            or checkpoint_sha256 is not None
+        ):
+            raise ValueError("Read/ack requires a positive expected_rev and no initial checkpoint")
+        body["expected_rev"] = expected_rev
+        if receipt_id is not None:
+            if not isinstance(receipt_id, str) or not re.fullmatch(r"[a-f0-9]{32}", receipt_id):
+                raise ValueError("Invalid receipt_id")
+            body["receipt_id"] = receipt_id
+        if action == "ack" and receipt_id is None:
+            raise ValueError("ACK requires the durably persisted page's receipt_id")
+        if action == "read":
+            body["limit"] = limit
+    url, key = _consumer_target(consumer_id, agent_id)
+    path = f"/detections/consumers/{consumer_id}" + ("" if action == "register" else "/" + action)
+    code, result = opencdr._request("POST", path, url, key, json=body)
+    _raise_on_error(code, result, "detection consumer " + action)
+    return result
+
+
+def _backfill_id(job_id):
+    if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", job_id):
+        raise ValueError("Invalid backfill job_id")
+    return job_id
+
+
+def _handoff_principal(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"aws(?:-us-gov|-cn)?:[0-9]{12}:(?:AROA|AIDA)[A-Z0-9]{12,64}", value
+    ):
+        raise ValueError("Use the immutable IAM principal identity, not a role ARN or session name")
+    return value
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_detection_recovery_status(
+    recovery_id: str | None = None, agent_id: str | None = None
+) -> dict:
+    """Inspect physical feed identity/digest, or a saved rotation plan/receipt."""
+    path = (
+        "/detections/storage"
+        if recovery_id is None
+        else "/detections/recoveries/" + _backfill_id(recovery_id)
+    )
+    url, key = _resolve_api(agent_id)
+    code, result = opencdr._request("GET", path, url, key)
+    _raise_on_error(code, result, "feed recovery status")
+    return result
+
+
+@_tool(CAP_MAINTENANCE, annotations=_DESTRUCTIVE)
+def opencdr_detection_recovery_update(
+    recovery_id: str,
+    action: Literal["plan", "apply"],
+    digest: str,
+    reason: str | None = None,
+    accept_unrecoverable: bool = False,
+    agent_id: str | None = None,
+) -> dict:
+    """Administrator: plan or apply reviewed feed rotation, preserving stored rows.
+
+    Plan uses the exact storage digest, reason and accepted uncertainty. Apply
+    uses the separately reviewed plan digest. Pause old writers before upgrade
+    and maintenance. This does not restore AWS resources or reconnect consumers.
+    """
+    _backfill_id(recovery_id)
+    if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise ValueError("Exact reviewed digest required")
+    if action == "plan":
+        if (
+            not isinstance(reason, str)
+            or not 1 <= len(reason) <= 512
+            or accept_unrecoverable is not True
+        ):
+            raise ValueError(
+                "Review reason and explicit acceptance of unavailable history required"
+            )
+        body = {"storage_digest": digest, "reason": reason, "accept_unrecoverable": True}
+        suffix = ""
+    elif action == "apply":
+        body, suffix = {"plan_digest": digest}, "/apply"
+    else:
+        raise ValueError("Use plan or apply")
+    url, key = _resolve_api(agent_id)
+    code, result = opencdr._request(
+        "POST", "/detections/recoveries/" + recovery_id + suffix, url, key, json=body
+    )
+    _raise_on_error(code, result, "feed recovery " + action)
+    return result
+
+
+def _recovery_checkpoint(value):
+    if not isinstance(value, dict) or set(value) != {
+        "cursor",
+        "sequence",
+        "receipt_id",
+        "principal",
+    }:
+        raise ValueError("Exact prior durable checkpoint required")
+    if type(value["sequence"]) is not int or not 0 <= value["sequence"] <= 10**18:
+        raise ValueError("Invalid prior sequence")
+    if value["cursor"] is None:
+        if value["sequence"] or value["receipt_id"] is not None:
+            raise ValueError("Only an empty checkpoint can omit its cursor")
+    elif not isinstance(value["cursor"], str) or not 1 <= len(value["cursor"]) <= 512:
+        raise ValueError("Invalid prior cursor")
+    if value["principal"] is not None:
+        _handoff_principal(value["principal"])
+    if value["receipt_id"] is not None and (
+        not isinstance(value["receipt_id"], str)
+        or not re.fullmatch(r"[a-f0-9]{32}", value["receipt_id"])
+    ):
+        raise ValueError("Invalid prior receipt")
+    return value
+
+
+@_tool(CAP_MAINTENANCE, annotations=_DESTRUCTIVE)
+def opencdr_detection_consumer_recover(
+    job_id: str,
+    plan_digest: str,
+    target_epoch: str,
+    target_owner: str,
+    previous_checkpoint: dict,
+    reason: str,
+    request_id: str,
+    accept_unrecoverable: bool = False,
+    agent_id: str | None = None,
+) -> dict:
+    """Direct IAM delivery: initialize a fresh recovery consumer after reviewed backfill.
+
+    Accepts unavailable history explicitly. The old consumer is never rewound.
+    Fleet must queue its recovery instead, so the worker accepts as itself.
+    """
+    body = _reconciliation_body(job_id, plan_digest, reason, request_id, accept_unrecoverable)
+    if not isinstance(target_epoch, str) or not re.fullmatch(r"[a-f0-9]{32}", target_epoch):
+        raise ValueError("Reviewed target epoch required")
+    body.update(
+        target_epoch=target_epoch,
+        target_owner=_handoff_principal(target_owner),
+        previous_checkpoint=_recovery_checkpoint(previous_checkpoint),
+    )
+    name = "recovery-" + request_id
+    url, key = _consumer_target(name, agent_id)
+    code, result = opencdr._request(
+        "POST", f"/detections/consumers/{name}/recover", url, key, json=body
+    )
+    _raise_on_error(code, result, "consumer recovery")
+    return result
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_detection_recovery_context(agent_id: str) -> dict:
+    """Administrator: read the exact local checkpoint and guards before recovery."""
+    return _fleet_call("GET", f"/v1/agents/{agent_identifier(agent_id)}/detections/recover")
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_DESTRUCTIVE, fleet_only=True)
+def opencdr_fleet_detection_recover(
+    agent_id: str,
+    expected_generation: int,
+    expected_registration_rev: int,
+    job_id: str,
+    plan_digest: str,
+    target_epoch: str,
+    target_owner: str,
+    reason: str,
+    request_id: str,
+    accept_unrecoverable: bool = False,
+    supersedes_request_id: str | None = None,
+) -> dict:
+    """Queue reviewed backfill replay into a fresh worker-owned delivery consumer.
+
+    Requires paused detection polling. Capture the exact local guards, review
+    backfill findings and the replacement worker principal. Completion preserves
+    existing Fleet records and leaves polling paused for separate verification.
+    """
+    for value in (expected_generation, expected_registration_rev):
+        if type(value) is not int or value < 1:
+            raise ValueError("Positive checkpoint and registration guards required")
+    body = _reconciliation_body(job_id, plan_digest, reason, request_id, accept_unrecoverable)
+    if not isinstance(target_epoch, str) or not re.fullmatch(r"[a-f0-9]{32}", target_epoch):
+        raise ValueError("Reviewed target epoch required")
+    body.update(
+        expected_generation=expected_generation,
+        expected_registration_rev=expected_registration_rev,
+        target_epoch=target_epoch,
+        target_owner=_handoff_principal(target_owner),
+    )
+    if supersedes_request_id is not None:
+        if not isinstance(supersedes_request_id, str) or not re.fullmatch(
+            r"[a-f0-9]{32}", supersedes_request_id
+        ):
+            raise ValueError("Invalid superseded request ID")
+        body["supersedes_request_id"] = supersedes_request_id
+    return _fleet_call("POST", f"/v1/agents/{agent_identifier(agent_id)}/detections/recover", body)
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_detection_handoff_status(handoff_id: str, agent_id: str | None = None) -> dict:
+    """Read a reviewed consumer handoff plan or permanent acceptance receipt."""
+    url, key = _resolve_api(agent_id)
+    code, result = opencdr._request(
+        "GET", "/detections/handoffs/" + _backfill_id(handoff_id), url, key
+    )
+    _raise_on_error(code, result, "consumer handoff status")
+    return result
+
+
+@_tool(CAP_MAINTENANCE, annotations=_MUTATING)
+def opencdr_detection_handoff_plan(
+    handoff_id: str,
+    consumer_id: str,
+    previous_owner: str,
+    target_owner: str,
+    cursor: str,
+    sequence: int,
+    reason: str,
+    receipt_id: str | None = None,
+    agent_id: str | None = None,
+) -> dict:
+    """Administrator: freeze a handoff plan for review without changing ownership.
+
+    Obtain Fleet's durable checkpoint from its handoff context tool. Use exact
+    old/new IAM principal IDs. Acceptance is separate and cannot reset progress.
+    A changed feed incarnation requires different recovery, not this operation.
+    """
+    for value in (handoff_id, consumer_id):
+        _backfill_id(value)
+    for value in (previous_owner, target_owner):
+        _handoff_principal(value)
+    if previous_owner == target_owner or type(sequence) is not int or sequence < 0:
+        raise ValueError("Different principals and a nonnegative durable sequence are required")
+    if (
+        not isinstance(cursor, str)
+        or not 1 <= len(cursor) <= 512
+        or not isinstance(reason, str)
+        or not 1 <= len(reason) <= 512
+    ):
+        raise ValueError("A durable cursor and review reason are required")
+    if receipt_id is not None and not re.fullmatch(r"[a-f0-9]{32}", receipt_id):
+        raise ValueError("Invalid receipt ID")
+    body = {
+        "consumer_id": consumer_id,
+        "previous_owner": previous_owner,
+        "target_owner": target_owner,
+        "reason": reason,
+        "checkpoint": {"cursor": cursor, "sequence": sequence, "receipt_id": receipt_id},
+    }
+    url, key = _resolve_api(agent_id)
+    code, result = opencdr._request(
+        "POST", "/detections/handoffs/" + handoff_id, url, key, json=body
+    )
+    _raise_on_error(code, result, "consumer handoff plan")
+    return result
+
+
+@_tool(CAP_MAINTENANCE, annotations=_DESTRUCTIVE)
+def opencdr_detection_handoff_accept(
+    consumer_id: str, handoff_id: str, plan_digest: str, agent_id: str | None = None
+) -> dict:
+    """Direct IAM delivery: accept a reviewed handoff as its exact new principal.
+
+    Retires the original consumer, preserving its cursor and pending receipt.
+    Fleet users must queue its handoff instead so the worker owns acceptance.
+    """
+    _backfill_id(handoff_id)
+    if not re.fullmatch(r"[a-f0-9]{64}", plan_digest):
+        raise ValueError("The exact reviewed plan digest is required")
+    url, key = _consumer_target(consumer_id, agent_id)
+    code, result = opencdr._request(
+        "POST",
+        f"/detections/consumers/{consumer_id}/handoff",
+        url,
+        key,
+        json={"handoff_id": handoff_id, "plan_digest": plan_digest},
+    )
+    _raise_on_error(code, result, "consumer handoff acceptance")
+    return result
+
+
+def _reconciliation_body(job_id, plan_digest, reason, request_id, accept_unrecoverable):
+    _backfill_id(job_id)
+    if (
+        not isinstance(plan_digest, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", plan_digest)
+        or not isinstance(request_id, str)
+        or not re.fullmatch(r"[a-f0-9]{32}", request_id)
+        or not isinstance(reason, str)
+        or not 1 <= len(reason) <= 512
+        or accept_unrecoverable is not True
+    ):
+        raise ValueError(
+            "Reviewed digest, request ID, reason and explicit acceptance "
+            "of unavailable history are required"
+        )
+    return {
+        "backfill_job_id": job_id,
+        "plan_digest": plan_digest,
+        "reason": reason,
+        "request_id": request_id,
+        "accept_unrecoverable": True,
+    }
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_detection_backfill_status(
+    job_id: str,
+    results: bool = False,
+    after: str | None = None,
+    limit: int = 50,
+    agent_id: str | None = None,
+) -> dict:
+    """Inspect a backfill plan/progress or bounded outcomes and skipped-source findings.
+
+    A completed retained-source scan does not prove complete history. Use results
+    and next_after to review invalid, expired or conflicting source records.
+    """
+    path = "/detections/backfills/" + _backfill_id(job_id)
+    if type(limit) is not int or not 1 <= limit <= 100 or (after is not None and not results):
+        raise ValueError("Results pagination requires results=true and limit 1–100")
+    if results:
+        path += "/results?" + _qs(after=after, limit=limit)
+    url, key = _resolve_api(agent_id)
+    code, result = opencdr._request("GET", path, url, key)
+    _raise_on_error(code, result, "backfill status")
+    return result
+
+
+@_tool(CAP_MAINTENANCE, annotations=_REPLAY)
+def opencdr_detection_backfill_update(
+    job_id: str,
+    action: Literal["plan", "step"],
+    reason: str | None = None,
+    expected_rev: int | None = None,
+    plan_digest: str | None = None,
+    limit: int = 10,
+    agent_id: str | None = None,
+) -> dict:
+    """Plan a retained-source import, or execute one reviewed bounded step.
+
+    Requires Core administrator access (also the selected agent's write access
+    in Fleet mode). Historical imports preserve IDs and do not evaluate rules or
+    replay notifications/responses. Inspect status after an uncertain request;
+    a lease can require waiting 60 seconds before a safe retry. Never invent IDs
+    or treat completion as proof of complete history.
+    """
+    path = "/detections/backfills/" + _backfill_id(job_id)
+    if action == "plan":
+        if (
+            not isinstance(reason, str)
+            or not 1 <= len(reason) <= 512
+            or expected_rev is not None
+            or plan_digest is not None
+        ):
+            raise ValueError("Plan requires only an explicit reason")
+        body = {"reason": reason}
+    elif action == "step":
+        if (
+            type(expected_rev) is not int
+            or expected_rev < 1
+            or reason is not None
+            or not isinstance(plan_digest, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", plan_digest)
+            or type(limit) is not int
+            or not 1 <= limit <= 25
+        ):
+            raise ValueError("Step requires exact expected_rev, plan_digest and limit 1–25")
+        body = {"expected_rev": expected_rev, "plan_digest": plan_digest, "limit": limit}
+        path += "/step"
+    else:
+        raise ValueError("action must be plan or step")
+    url, key = _resolve_api(agent_id)
+    code, result = opencdr._request("POST", path, url, key, json=body)
+    _raise_on_error(code, result, "backfill " + action)
+    return result
+
+
+@_tool(CAP_SETTINGS, annotations=_DESTRUCTIVE)
+def opencdr_detection_consumer_reconcile(
+    consumer_id: str,
+    expected_rev: int,
+    job_id: str,
+    plan_digest: str,
+    reason: str,
+    request_id: str,
+    accept_unrecoverable: bool = False,
+    agent_id: str | None = None,
+) -> dict:
+    """Explicitly accept unavailable history and resume this consumer at a completed import.
+
+    Direct Core delivery only. Review the job and findings first. This discards
+    the pending receipt and records accepted loss; it is not proof of full recovery.
+    Retry the same request_id and content after an uncertain response. Fleet uses
+    opencdr_fleet_detection_reconcile so its original worker retains ownership.
+    """
+    if type(expected_rev) is not int or expected_rev < 1:
+        raise ValueError("expected_rev must be positive")
+    body = _reconciliation_body(job_id, plan_digest, reason, request_id, accept_unrecoverable)
+    url, key = _consumer_target(consumer_id, agent_id)
+    code, result = opencdr._request(
+        "POST",
+        f"/detections/consumers/{consumer_id}/reconcile",
+        url,
+        key,
+        json={**body, "expected_rev": expected_rev},
+    )
+    _raise_on_error(code, result, "consumer reconciliation")
+    return result
+
+
+def _indexed_detection_read(path: str) -> dict:
+    if opencdr.connection_mode(opencdr._load_config()) == "fleet":
+        return _fleet_call("GET", "/v1" + path)
+    url, key = _resolve_api()
+    status, body = opencdr._request("GET", path, url, key)
+    _raise_on_error(status, body, "indexed detections")
+    return body
+
+
+def _library_call(method, path, payload=None):
+    cfg = opencdr._load_config()
+    if opencdr.connection_mode(cfg) == "fleet":
+        return _fleet_call(method, "/v1" + path, payload)
+    if cfg.get("auth_mode") != "iam":
+        raise OpenCDRConfigError("Content library requires IAM")
+    url, key = _resolve_api()
+    code, report = opencdr._request("GET", "/status", url, key)
+    _raise_on_error(code, report, "library capability")
+    if report.get("capabilities", {}).get("content_library") != "1.0.0":
+        raise RuntimeError("Core content library capability unavailable")
+    code, result = opencdr._request(
+        method, path, url, key, **({"json": payload} if payload is not None else {})
+    )
+    _raise_on_error(code, result, "content library")
+    return result
+
+
+def _library_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{32}", value):
+        raise ValueError("A 32-character lowercase hex library ID is required")
+    return value
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_library_read(
+    view: str = "items",
+    content_id: str | None = None,
+    version: int | None = None,
+    release_id: str | None = None,
+    after: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """Read owner-wide drafts, immutable versions/history, or frozen release snapshots.
+
+    Views: items, item, versions, version, artifact, history, releases, release,
+    manifest. Saved/frozen content is not validated, approved or active runtime content.
+    Pagination uses next_after; versions/history are in ascending numeric order.
+    """
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError("Library limit must be 1..50")
+    lists = {"items", "versions", "history", "releases"}
+    if view in {"items", "releases"}:
+        if content_id is not None or release_id is not None or version is not None:
+            raise ValueError("List views do not take item selectors")
+        path = "/library/" + view
+    elif view in {"release", "manifest"}:
+        if content_id is not None or version is not None:
+            raise ValueError("Release views require only release_id")
+        path = "/library/releases/" + _library_id(release_id)
+        if view == "manifest":
+            path += "/artifact"
+    elif view in {"item", "versions", "version", "artifact", "history"}:
+        if release_id is not None:
+            raise ValueError("Item views do not take release_id")
+        path = "/library/items/" + _library_id(content_id)
+        if view in {"version", "artifact"}:
+            if type(version) is not int or not 1 <= version <= 9007199254740991:
+                raise ValueError("A positive version is required")
+            path += f"/versions/{version}" + ("/artifact" if view == "artifact" else "")
+        elif version is not None:
+            raise ValueError("This view does not take a version")
+        elif view != "item":
+            path += "/" + view
+    else:
+        raise ValueError("Unknown library view")
+    if view in lists:
+        params = {"limit": limit}
+        if after is not None:
+            if view in {"versions", "history"}:
+                if (
+                    not isinstance(after, str)
+                    or not re.fullmatch(r"[0-9]{1,16}", after)
+                    or int(after) > 9007199254740991
+                ):
+                    raise ValueError("Invalid numeric library cursor")
+            else:
+                _library_id(after)
+            params["after"] = after
+        path += "?" + urlencode(params)
+    elif after is not None:
+        raise ValueError("Only list views take a cursor")
+    return _library_call("GET", path)
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, central=True)
+def opencdr_library_write(operation: str, payload: dict, content_id: str | None = None) -> dict:
+    """Save library metadata, a new immutable draft version, or a frozen snapshot.
+
+    Every payload requires stable request_id (32 hex) and reason. create: kind
+    (signal/correlation/list), runtime_id, title, description. update: expected_rev,
+    title, description, archived. version: expected_rev, document, dependencies
+    [{content_id,version,artifact_sha256}], provenance ({kind: authored} or declared
+    pinned import metadata). release: title, description, items (pinned references).
+    Retry unknown outcomes with identical payload and request_id. This never validates,
+    approves, deploys, fetches Git or changes runtime rules. Library is owner-wide.
+    """
+    fields = {
+        "create": {"kind", "runtime_id", "title", "description"},
+        "update": {"expected_rev", "title", "description", "archived"},
+        "version": {"expected_rev", "document", "dependencies", "provenance"},
+        "release": {"title", "description", "items"},
+    }
+    if (
+        operation not in fields
+        or not isinstance(payload, dict)
+        or set(payload) != fields[operation] | {"request_id", "reason"}
+    ):
+        raise ValueError("Provide only the documented library fields")
+    _library_id(payload["request_id"])
+    if (
+        not isinstance(payload["reason"], str)
+        or not payload["reason"].strip()
+        or len(payload["reason"]) > 1000
+    ):
+        raise ValueError("A library change reason is required")
+    if operation in {"create", "release"}:
+        if content_id is not None:
+            raise ValueError("The library assigns its own ID")
+        path = "/library/" + ("items" if operation == "create" else "releases")
+    else:
+        if (
+            type(payload["expected_rev"]) is not int
+            or not 1 <= payload["expected_rev"] <= 9007199254740991
+        ):
+            raise ValueError("Read the current library revision first")
+        path = (
+            "/library/items/"
+            + _library_id(content_id)
+            + ("/versions" if operation == "version" else "")
+        )
+    return _library_call("PUT" if operation == "update" else "POST", path, payload)
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, central=True)
+def opencdr_library_quality(operation: str, owner_id: str, payload: dict) -> dict:
+    """Persist a native test, verify a pinned Git import, compile, or map legacy content.
+
+    Owner ID is content_id for test/import; release_id for compile/mapping.
+    All commands require request_id and reason. test: reference, events (max 100),
+    expected_matches (sorted event indexes). import: expected_rev, dependencies,
+    provenance (GitHub repository, exact commit/path/upstream_sha256). compile:
+    artifact_sha256 of the frozen release. runtime_import: expected_rev, dependencies,
+    source_deployment, source_revision and source_sha256 from a verified observation.
+    mapping: compilation_id, legacy_manifest,
+    manifest_digest. These operations never promote content or change runtime state.
+    Retry an uncertain result with the unchanged request ID and payload.
+    """
+    fields = {
+        "test": {"reference", "events", "expected_matches"},
+        "import": {"expected_rev", "dependencies", "provenance"},
+        "runtime_import": {
+            "expected_rev",
+            "dependencies",
+            "source_deployment",
+            "source_revision",
+            "source_sha256",
+        },
+        "compile": {"artifact_sha256"},
+        "mapping": {"compilation_id", "legacy_manifest", "manifest_digest"},
+    }
+    if (
+        operation not in fields
+        or not isinstance(payload, dict)
+        or set(payload) != fields[operation] | {"request_id", "reason"}
+    ):
+        raise ValueError("Provide only the documented quality fields")
+    _library_id(payload["request_id"])
+    if (
+        not isinstance(payload["reason"], str)
+        or not payload["reason"].strip()
+        or len(payload["reason"]) > 1000
+    ):
+        raise ValueError("A change reason is required")
+    if len(json.dumps(payload, allow_nan=False).encode()) > 131072:
+        raise ValueError("Library request exceeds byte limit")
+    resource, sub = {
+        "test": ("items", "tests"),
+        "import": ("items", "imports"),
+        "runtime_import": ("items", "runtime-imports"),
+        "compile": ("releases", "compilations"),
+        "mapping": ("releases", "mappings"),
+    }[operation]
+    return _library_call("POST", f"/library/{resource}/{_library_id(owner_id)}/{sub}", payload)
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_library_evidence(
+    view: str,
+    owner_id: str,
+    record_id: str | None = None,
+    after: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """Read retained tests, compilations or legacy mappings and their freshness.
+
+    Use views tests (content_id), compilations or mappings (release_id). Omit
+    record_id for a bounded page; select a record to read its exact artifact.
+    Historical passes never imply the latest content, current evaluator or runtime acceptance.
+    """
+    if view not in {"tests", "compilations", "mappings"}:
+        raise ValueError("Unknown evidence view")
+    resource = "items" if view == "tests" else "releases"
+    path = f"/library/{resource}/{_library_id(owner_id)}/{view}"
+    if record_id is not None:
+        if after is not None:
+            raise ValueError("Record reads do not take a cursor")
+        path += "/" + _library_id(record_id)
+    else:
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("Library limit must be 1..50")
+        params = {"limit": limit}
+        if after is not None:
+            params["after"] = _library_id(after)
+        path += "?" + urlencode(params)
+    return _library_call("GET", path)
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_library_runtime_source(
+    content_id: str, source_deployment: str, source_revision: str
+) -> dict:
+    """Preview a verified Core-local or fresh scoped Fleet snapshot for runtime import.
+
+    Returns the exact source document, canonical hash and observation time. This is
+    read-only; pass the returned hash/revision in a separate runtime_import command.
+    """
+    if (
+        not isinstance(source_deployment, str)
+        or not 1 <= len(source_deployment) <= 256
+        or not isinstance(source_revision, str)
+        or not 1 <= len(source_revision) <= 128
+    ):
+        raise ValueError("Source deployment and revision are required")
+    return _library_call(
+        "GET",
+        "/library/items/"
+        + _library_id(content_id)
+        + "/runtime-source?"
+        + urlencode({"source_deployment": source_deployment, "source_revision": source_revision}),
+    )
+
+
+def _review_call(method, path, payload=None):
+    cfg = opencdr._load_config()
+    if opencdr.connection_mode(cfg) == "fleet":
+        return _fleet_call(method, "/v1" + path, payload)
+    if cfg.get("auth_mode") != "iam":
+        raise OpenCDRConfigError("Owner reviews require IAM")
+    url, key = _resolve_api()
+    code, result = opencdr._request(
+        method, path, url, key, **({"json": payload} if payload is not None else {})
+    )
+    _raise_on_error(code, result, "owner review registry")
+    return result
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_reviews_read(
+    approval_id: str | None = None, limit: int = 20, after: str | None = None
+) -> dict:
+    """Read the owner-scoped approval inbox or one exact review and its binding.
+
+    Current owner grants filter results. Follow next_after even for an empty page.
+    A registry decision does not execute a mutation or authorize a queued job.
+    """
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError("Review page limit must be 1 to 50")
+    if approval_id is not None:
+        if after is not None:
+            raise ValueError("A detail read does not accept a cursor")
+        return _review_call("GET", "/reviews/" + _case_id(approval_id))
+    if after is not None and (not isinstance(after, str) or not 1 <= len(after) <= 1024):
+        raise ValueError("Invalid review cursor")
+    return _review_call("GET", "/reviews?" + _qs(limit=limit, after=after))
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, central=True)
+def opencdr_review_decide(approval_id: str, payload: dict, withdraw: bool = False) -> dict:
+    """Record a review decision or withdrawal; never execute the reviewed operation.
+
+    Preserve expected_rev, request_id and reason on retries. Decisions additionally
+    require approve (boolean) and mode: peer, self_exception or emergency. The
+    owner enforces live review and response grants; the client grants no authority.
+    """
+    identity = _case_id(approval_id)
+    fields = {"expected_rev", "request_id", "reason"} | (set() if withdraw else {"approve", "mode"})
+    if type(withdraw) is not bool or not isinstance(payload, dict) or set(payload) != fields:
+        raise ValueError("Invalid review decision fields")
+    if type(payload["expected_rev"]) is not int or payload["expected_rev"] < 1:
+        raise ValueError("An exact review revision is required")
+    _case_id(payload["request_id"])
+    if not isinstance(payload["reason"], str) or not 1 <= len(payload["reason"].strip()) <= 1000:
+        raise ValueError("A review reason is required")
+    if not withdraw and (
+        type(payload["approve"]) is not bool
+        or payload["mode"] not in ("peer", "self_exception", "emergency")
+    ):
+        raise ValueError("An explicit decision and configured review mode are required")
+    return _review_call(
+        "POST", "/reviews/" + identity + ("/withdrawals" if withdraw else "/decisions"), payload
+    )
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, central=True)
+def opencdr_review_propose(payload: dict) -> dict:
+    """Retain an owner-compiled proposal. This neither approves nor executes it.
+
+    Supply operation, expires_at, request_id and reason. The owner resolves exact
+    dependencies and targets; never supply a client-made authorization plan.
+    """
+    if not isinstance(payload, dict) or set(payload) != {
+        "operation",
+        "expires_at",
+        "request_id",
+        "reason",
+    }:
+        raise ValueError("Invalid review proposal")
+    _case_id(payload["request_id"])
+    if type(payload["expires_at"]) is not int or payload["expires_at"] <= 0:
+        raise ValueError("An explicit approval expiry is required")
+    return _review_call("POST", "/reviews", payload)
+
+
+def _execution_payload(payload: dict, extra=()) -> dict:
+    if not isinstance(payload, dict) or set(payload) != {
+        "expected_rev",
+        "request_id",
+        "reason",
+        *extra,
+    }:
+        raise ValueError("Invalid reviewed execution fields")
+    if type(payload["expected_rev"]) is not int or payload["expected_rev"] < 1:
+        raise ValueError("An exact approval revision is required")
+    _case_id(payload["request_id"])
+    if not isinstance(payload["reason"], str) or not 1 <= len(payload["reason"].strip()) <= 1000:
+        raise ValueError("An execution reason is required")
+    return payload
+
+
+def _core_execution_call(method, path, payload=None):
+    cfg = opencdr._load_config()
+    if opencdr.connection_mode(cfg) == "fleet":
+        raise OpenCDRConfigError("Use a reviewed Fleet distribution job for member mutations")
+    return _review_call(method, path, payload)
+
+
+@_tool(CAP_RULES, annotations=_RELEASE, core_only=True)
+def opencdr_review_execute(approval_id: str, payload: dict) -> dict:
+    """Execute an exact Core approval once; retain the request ID for reconciliation.
+
+    Requires live owner authority. A committed receipt proves stored configuration;
+    evaluator activation requires a separate verification read. No automatic retry.
+    """
+    return _core_execution_call(
+        "POST", "/reviews/" + _case_id(approval_id) + "/execute", _execution_payload(payload)
+    )
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, core_only=True)
+def opencdr_review_execution(approval_id: str, verify: bool = False) -> dict:
+    """Read the durable Core receipt or freshly compare stored/effective state."""
+    if type(verify) is not bool:
+        raise ValueError("verify must be boolean")
+    return _core_execution_call(
+        "GET", "/reviews/" + _case_id(approval_id) + ("/verification" if verify else "/execution")
+    )
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, core_only=True)
+def opencdr_review_cancel(approval_id: str, payload: dict) -> dict:
+    """Cancel an unstarted Core reviewed job; cannot reset a started or uncertain effect."""
+    return _core_execution_call(
+        "POST", "/reviews/" + _case_id(approval_id) + "/cancel", _execution_payload(payload)
+    )
+
+
+@_tool(CAP_RULES, annotations=_RELEASE, central=True)
+def opencdr_routing_activate(approval_id: str, payload: dict) -> dict:
+    """Activate an approved owner routing configuration pinned to a Library version.
+
+    This writes finite-lived configuration, not a feed subscription. Check the
+    returned worker_connected flag; never claim automatic routing when false.
+    """
+    return _review_call(
+        "POST", "/reviews/" + _case_id(approval_id) + "/activate", _execution_payload(payload)
+    )
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_routing_activation(approval_id: str) -> dict:
+    """Read retained owner routing activation, expiry and feed connection status."""
+    return _review_call("GET", "/reviews/" + _case_id(approval_id) + "/activation")
+
+
+def _case_call(method, path, payload=None):
+    cfg = opencdr._load_config()
+    if opencdr.connection_mode(cfg) == "fleet":
+        # Cases belong to Fleet; never address or fall back to a member Core.
+        return _fleet_call(method, "/v1" + path, payload)
+    if cfg.get("auth_mode") != "iam":
+        raise OpenCDRConfigError("Operational cases require IAM")
+    url, key = _resolve_api()
+    code, report = opencdr._request("GET", "/status", url, key)
+    _raise_on_error(code, report, "case capability")
+    if report.get("capabilities", {}).get("operational_cases") != "1.0.0":
+        raise RuntimeError("Core operational case capability unavailable")
+    code, result = opencdr._request(
+        method, path, url, key, **({"json": payload} if payload is not None else {})
+    )
+    _raise_on_error(code, result, "operational cases")
+    return result
+
+
+def _case_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{32}", value):
+        raise ValueError("A 32-character lowercase hex case ID is required")
+    return value
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_cases_list(
+    agent_ids: list[str] | None = None,
+    status: str | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+) -> dict:
+    """List operational cases from the configured authority. Scope must include every case account.
+
+    Counts apply to this page. Continue even an empty page when next_cursor is set.
+    Fleet requires explicit server-side principal grants; a filter never grants access.
+    """
+    if (
+        type(limit) is not int
+        or not 1 <= limit <= 50
+        or (status is not None and status not in {"open", "investigating", "contained", "closed"})
+    ):
+        raise ValueError("Invalid case filter or page size")
+    if agent_ids is not None and (
+        not isinstance(agent_ids, list)
+        or not 1 <= len(agent_ids) <= 100
+        or any(
+            not isinstance(a, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", a)
+            for a in agent_ids
+        )
+        or len(set(agent_ids)) != len(agent_ids)
+    ):
+        raise ValueError("Select 1 to 100 unique account identifiers")
+    return _case_call(
+        "GET",
+        "/cases?"
+        + _qs(
+            agent_ids=",".join(agent_ids) if agent_ids else None,
+            status=status,
+            limit=limit,
+            cursor=cursor,
+        ),
+    )
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_case_read(
+    view: str = "case",
+    case_id: str | None = None,
+    attachment_id: str | None = None,
+    after: int = 0,
+    limit: int = 20,
+) -> dict:
+    """Read a case, immutable history, retained evidence, or the signer's account access.
+
+    view is case, history, evidence, or access. Status labels track work in a SIEM;
+    they do not execute an investigation or change detection handling.
+    """
+    if view == "access":
+        return _case_call("GET", "/case-access")
+    path = "/cases/" + _case_id(case_id)
+    if view == "history":
+        if type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("Invalid case history pagination")
+        path += "/history?" + _qs(after=after, limit=limit)
+    elif view == "evidence":
+        if not isinstance(attachment_id, str) or not re.fullmatch(r"[a-f0-9]{64}", attachment_id):
+            raise ValueError("A retained attachment ID is required")
+        path += "/evidence?" + _qs(attachment_id=attachment_id)
+    elif view != "case":
+        raise ValueError("Unknown case view")
+    return _case_call("GET", path)
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_case_active(agent_id: str, detection_id: str, agent_ids: list[str]) -> dict:
+    """Find the accessible active case for one detection in a complete account scope.
+
+    Fleet reads its own index without contacting a member Core. A 404 does not
+    prove global absence: the case can include accounts outside your grants/scope.
+    """
+    if (
+        not isinstance(agent_ids, list)
+        or not 1 <= len(agent_ids) <= 100
+        or any(
+            not isinstance(a, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", a)
+            for a in agent_ids
+        )
+        or len(set(agent_ids)) != len(agent_ids)
+        or agent_id not in agent_ids
+        or not isinstance(detection_id, str)
+        or not detection_id.strip()
+        or len(detection_id) > 512
+    ):
+        raise ValueError("Provide the detection identity and 1 to 100 unique account identifiers")
+    return _case_call(
+        "GET",
+        "/cases/active?"
+        + _qs(agent_id=agent_id, detection_id=detection_id, agent_ids=",".join(sorted(agent_ids))),
+    )
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_DESTRUCTIVE, central=True)
+def opencdr_case_integration(integration_id: str, payload: dict | None = None) -> dict:
+    """Read or bind a dedicated connector principal to scoped SIEM status reporting.
+
+    Administrator only. Supply principal, agent_ids, enabled, incident_origin
+    (HTTPS origin), max_age_seconds (60..604800), expected_rev, request_id and reason.
+    This configures trust; it does not fetch SIEM data or submit incident status.
+    Use Deploy with dedicated integration IAM access for machine connector reports.
+    """
+    if not isinstance(integration_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,64}", integration_id
+    ):
+        raise ValueError("Invalid integration ID")
+    if payload is not None:
+        fields = {
+            "principal",
+            "agent_ids",
+            "enabled",
+            "incident_origin",
+            "max_age_seconds",
+            "expected_rev",
+            "request_id",
+            "reason",
+        }
+        if not isinstance(payload, dict) or set(payload) != fields:
+            raise ValueError("Provide only the documented connector binding fields")
+        _case_id(payload["request_id"])
+        if (
+            type(payload["expected_rev"]) is not int
+            or payload["expected_rev"] < 0
+            or not isinstance(payload["reason"], str)
+            or not payload["reason"].strip()
+        ):
+            raise ValueError("Read the current binding revision and provide a reason")
+    return _case_call(
+        "GET" if payload is None else "PUT", "/case-integrations/" + integration_id, payload
+    )
+
+
+@_tool(CAP_TRIAGE, annotations=_READ_ONLY, central=True)
+def opencdr_case_routing_preview(
+    policy: dict, agent_id: str, detection_id: str, case_id: str | None = None
+) -> dict:
+    """Preview a draft routing policy against owner-verified evidence, without writes.
+
+    The owner validates exact rule versions, grouping, event-time windows and case
+    scope. This never activates policy, creates/joins/reopens a case, sends a page
+    or invokes a provider. effective_policy_revision remains null for this draft.
+    Historical evidence without a rule fingerprint returns an explicit manual result.
+    """
+    if (
+        not isinstance(policy, dict)
+        or not isinstance(agent_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", agent_id)
+        or not isinstance(detection_id, str)
+        or not 1 <= len(detection_id) <= 512
+    ):
+        raise ValueError("A routing policy, scoped agent and detection identity are required")
+    body = {"policy": policy, "agent_id": agent_id, "detection_id": detection_id}
+    if case_id is not None:
+        body["case_id"] = _case_id(case_id)
+    return _case_call("POST", "/cases/routing/preview", body)
+
+
+@_tool(CAP_TRIAGE, annotations=_MUTATING, central=True)
+def opencdr_case_mutate(operation: str, payload: dict, case_id: str | None = None) -> dict:
+    """Create, update, note, attach or detach an operational case with audited concurrency checks.
+
+    Every payload needs request_id (stable 32-hex) and reason. Create also needs title,
+    description, severity, agent_ids. Other operations require expected_rev and:
+    update: changes; note: text; attach: agent_id+detection_id; detach: attachment_id.
+    Retry an unknown outcome with the identical payload and request_id. Closing releases
+    active detection links. Reopening can conflict with another active case.
+    """
+    fields = {
+        "create": {"title", "description", "severity", "agent_ids"},
+        "update": {"changes"},
+        "note": {"text"},
+        "attach": {"agent_id", "detection_id"},
+        "detach": {"attachment_id"},
+    }
+    if operation not in fields or not isinstance(payload, dict):
+        raise ValueError("Unknown case operation")
+    expected = (
+        fields[operation]
+        | {"request_id", "reason"}
+        | (set() if operation == "create" else {"expected_rev"})
+    )
+    if set(payload) != expected:
+        raise ValueError("Provide only the documented case fields")
+    _case_id(payload["request_id"])
+    if not isinstance(payload["reason"], str) or not 1 <= len(payload["reason"].strip()) <= 1000:
+        raise ValueError("A case change reason is required")
+    if operation == "create":
+        if case_id is not None:
+            raise ValueError("Create assigns its own case ID")
+        return _case_call("POST", "/cases", payload)
+    if type(payload["expected_rev"]) is not int or payload["expected_rev"] < 1:
+        raise ValueError("Read the current case revision first")
+    path = (
+        "/cases/"
+        + _case_id(case_id)
+        + {"update": "", "note": "/notes", "attach": "/detections", "detach": "/detections/detach"}[
+            operation
+        ]
+    )
+    return _case_call("PUT" if operation == "update" else "POST", path, payload)
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_DESTRUCTIVE, fleet_only=True)
+def opencdr_fleet_case_access(
+    principal: str, agent_ids: list[str], expected_rev: int, request_id: str, reason: str
+) -> dict:
+    """Grant/revoke case account access for an immutable AWS signer. Empty agent_ids revokes.
+
+    Use the canonical principal from opencdr_case_read(view='access'). No implicit
+    administrator data access. End-user delegation is separate from this service grant.
+    """
+    _case_id(request_id)
+    if (
+        type(expected_rev) is not int
+        or expected_rev < 0
+        or not isinstance(principal, str)
+        or not re.fullmatch(
+            r"aws(?:-us-gov|-cn)?:[0-9]{12}:(?:AROA|AIDA)[A-Z0-9]{12,64}", principal
+        )
+    ):
+        raise ValueError("Invalid principal or grant revision")
+    return _fleet_call(
+        "PUT",
+        "/v1/case-access",
+        {
+            "principal": principal,
+            "agent_ids": agent_ids,
+            "expected_rev": expected_rev,
+            "request_id": request_id,
+            "reason": reason,
+        },
+    )
+
+
+def _handling_call(
+    method, detection_id, agent_id=None, body=None, history=False, after=None, limit=50
+):
+    if not isinstance(detection_id, str) or not 1 <= len(detection_id) <= 512:
+        raise ValueError("A detection ID is required")
+    path = "/detections/handling" + ("/history" if history else "")
+    path += "?" + _qs(
+        detection_id=detection_id,
+        after=after if history else None,
+        limit=limit if history else None,
+    )
+    cfg = opencdr._load_config()
+    if opencdr.connection_mode(cfg) == "fleet":
+        return _fleet_call(method, f"/v1/agents/{agent_identifier(agent_id)}" + path, body)
+    if cfg.get("auth_mode") != "iam":
+        raise OpenCDRConfigError("Detection handling requires an IAM Core connection")
+    url, key = _resolve_api(agent_id)
+    code, report = opencdr._request("GET", "/status", url, key)
+    _raise_on_error(code, report, "handling capability")
+    if report.get("capabilities", {}).get("detection_handling") != "1.0.0":
+        raise RuntimeError("Core handling capability unavailable; no edit sent")
+    code, result = opencdr._request(
+        method, path, url, key, **({"json": body} if body is not None else {})
+    )
+    _raise_on_error(code, result, "detection handling")
+    return result
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_response_outcomes(
+    detection_id: str,
+    agent_id: str | None = None,
+    attempt_id: str | None = None,
+    after: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """Read retained response/rollback observations or one attempt's immutable history.
+
+    Fleet forwards only this selected Core read. No historical backfill. Failed
+    can include partial effects; unknown requires reconciliation before replay.
+    after is the previous next_after; limit is 1..50. No mutation or replay occurs.
+    """
+    if (
+        not isinstance(detection_id, str)
+        or not detection_id.strip()
+        or len(detection_id) > 512
+        or type(limit) is not int
+        or not 1 <= limit <= 50
+    ):
+        raise ValueError("Invalid detection or page size")
+    if attempt_id is not None:
+        _case_id(attempt_id)
+    if after is not None:
+        if not isinstance(after, str) or (attempt_id and not re.fullmatch(r"[0-9]{1,12}", after)):
+            raise ValueError("Invalid outcome cursor")
+        if not attempt_id:
+            _case_id(after)
+    path = (
+        "/detections/outcomes"
+        + ("/history" if attempt_id else "")
+        + "?"
+        + _qs(detection_id=detection_id, attempt_id=attempt_id, after=after, limit=limit)
+    )
+    cfg = opencdr._load_config()
+    if opencdr.connection_mode(cfg) == "fleet":
+        return _fleet_call("GET", f"/v1/agents/{agent_identifier(agent_id)}" + path)
+    if cfg.get("auth_mode") != "iam":
+        raise OpenCDRConfigError("Response outcomes require IAM")
+    url, key = _resolve_api(agent_id)
+    code, status = opencdr._request("GET", "/status", url, key)
+    _raise_on_error(code, status, "outcome capability")
+    if status.get("capabilities", {}).get("response_outcomes") != "1.0.0":
+        raise RuntimeError("Core outcome capability unavailable")
+    code, result = opencdr._request("GET", path, url, key)
+    _raise_on_error(code, result, "response outcomes")
+    return result
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_detection_handling(
+    detection_id: str,
+    agent_id: str | None = None,
+    history: bool = False,
+    after: int = 0,
+    limit: int = 50,
+) -> dict:
+    """Read Core-owned handling or immutable audit history via the configured owner.
+
+    Unlike indexed browsing, Fleet forwards this selected-record request to its Core.
+    SIEM references are manual and unverified; investigation remains in the SIEM.
+    """
+    if (
+        type(after) is not int
+        or after < 0
+        or type(limit) is not int
+        or not 1 <= limit <= 100
+        or type(history) is not bool
+    ):
+        raise ValueError("Invalid audit pagination")
+    return _handling_call("GET", detection_id, agent_id, history=history, after=after, limit=limit)
+
+
+@_tool(CAP_TRIAGE, annotations=_MUTATING)
+def opencdr_detection_handling_update(
+    detection_id: str,
+    expected_rev: int,
+    request_id: str,
+    reason: str,
+    changes: dict,
+    agent_id: str | None = None,
+) -> dict:
+    """Edit status/disposition/assignment/note/manual SIEM references with audit and CAS.
+
+    Read the current handling revision first. Supply a stable 32-character lowercase
+    hex request ID; after a lost reply retry EXACTLY the same body and ID. A new edit
+    needs a new ID and current revision. No response execution or evidence change.
+    Fleet requires allow_triage and returns projection_state=pending after Core confirms.
+    """
+    if (
+        type(expected_rev) is not int
+        or expected_rev < 0
+        or not isinstance(request_id, str)
+        or not re.fullmatch(r"[a-f0-9]{32}", request_id)
+    ):
+        raise ValueError("Expected revision and stable request ID are required")
+    if (
+        not isinstance(reason, str)
+        or not 1 <= len(reason.strip()) <= 1000
+        or not isinstance(changes, dict)
+        or not changes
+        or set(changes) - {"status", "disposition", "assigned_to", "note", "external_refs"}
+    ):
+        raise ValueError("A reason and supported handling changes are required")
+    return _handling_call(
+        "PUT",
+        detection_id,
+        agent_id,
+        {
+            "expected_rev": expected_rev,
+            "request_id": request_id,
+            "reason": reason,
+            "changes": changes,
+        },
+    )
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_detections_query(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 50,
+    next_token: str | None = None,
+    agent_ids: list[str] | None = None,
+    account_ids: list[str] | None = None,
+    severities: list[Severity] | None = None,
+    kind: Literal["signal", "correlation"] | None = None,
+    rule_id: str | None = None,
+    source: str | None = None,
+    integration_id: str | None = None,
+    summary: bool = False,
+    status: Literal["open", "acknowledged", "resolved", "dismissed"] | None = None,
+    disposition: str | None = None,
+    has_incident: bool | None = None,
+) -> dict:
+    """Query indexed signals/correlations, or bounded counts, in the configured owner.
+
+    Fleet mode reads Fleet's central index without live member fanout. Core mode
+    reads the selected Core. Inclusive dates filter Core commit time, max 90 days.
+    Cursors bind the filters and expire after one hour. Empty pages may have more
+    results; inspect next_token, coverage and (for summaries) complete. A summary
+    with complete=false is a lower bound, never a proven fleet total. No ACK/write.
+    """
+    if type(limit) is not int or not 1 <= limit <= 100 or type(summary) is not bool:
+        raise ValueError("limit must be 1–100 and summary must be boolean")
+    for values, pattern in ((agent_ids, r"[A-Za-z0-9_.:-]{1,128}"), (account_ids, r"[0-9]{12}")):
+        if values is not None and (
+            not isinstance(values, list)
+            or not 1 <= len(values) <= 100
+            or any(not isinstance(v, str) or not re.fullmatch(pattern, v) for v in values)
+        ):
+            raise ValueError("Select 1–100 valid agent or account IDs")
+    if next_token is not None and (
+        not isinstance(next_token, str) or not 1 <= len(next_token) <= 4096
+    ):
+        raise ValueError("Invalid detection cursor")
+    for value in (rule_id, source, integration_id):
+        if value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 128):
+            raise ValueError("Invalid detection filter")
+    query = _qs(
+        status=status,
+        disposition=disposition,
+        has_incident=str(has_incident).lower() if has_incident is not None else None,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+        next_token=next_token,
+        agent_ids=",".join(sorted(set(agent_ids))) if agent_ids else None,
+        account_ids=",".join(sorted(set(account_ids))) if account_ids else None,
+        severity=",".join(sorted(set(severities))) if severities else None,
+        kind=kind,
+        rule_id=rule_id,
+        source=source,
+        integration_id=integration_id,
+    )
+    return _indexed_detection_read(("/detections/summary?" if summary else "/detections?") + query)
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_detection_detail(detection_id: str, agent_id: str | None = None) -> dict:
+    """Fetch exact retained detection evidence. Fleet requires an explicit agent ID.
+
+    No live member request is used in Fleet mode. Missing/expired evidence and
+    integrity failures remain errors; they are never treated as an empty finding.
+    """
+    if not isinstance(detection_id, str) or not 1 <= len(detection_id) <= 512:
+        raise ValueError("A detection ID is required")
+    if opencdr.connection_mode(opencdr._load_config()) == "fleet":
+        agent_identifier(agent_id)
+    return _indexed_detection_read(
+        "/detections/detail?" + _qs(detection_id=detection_id, agent_id=agent_id)
+    )
 
 
 @_tool(CAP_READ, annotations=_READ_ONLY)
@@ -932,11 +2387,17 @@ def opencdr_settings_set(
 
 
 @_tool(CAP_SETTINGS, annotations=_DESTRUCTIVE)
-def opencdr_settings_delete(setting_id: str = "global", agent_id: str | None = None) -> dict:
+def opencdr_settings_delete(
+    setting_id: str = "global", agent_id: str | None = None, expected_rev: int | None = None
+) -> dict:
     """Delete an OpenCDR settings document by id. DESTRUCTIVE and irreversible."""
     url, key = _resolve_api(agent_id)
     status, body = opencdr._request(
-        "DELETE", f"/settings/{_seg(setting_id, 'setting_id')}", url, key
+        "DELETE",
+        f"/settings/{_seg(setting_id, 'setting_id')}"
+        + ("?" + _qs(expected_rev=expected_rev) if expected_rev is not None else ""),
+        url,
+        key,
     )
     if status == 404:
         return {"found": False, "setting_id": setting_id}
@@ -1009,6 +2470,7 @@ def opencdr_ir_roles_upsert(
             "role_arn account does not match aws_account_id -- cross-account role mapping refused"
         )
     url, key = _resolve_api(agent_id)
+    _require_capability(url, key, "ir_role_revision_guards")
     if expected_rev is None:
         read_status, current = opencdr._request(
             "GET", f"/ir-roles/{_seg(aws_account_id, 'aws_account_id')}", url, key
@@ -1030,7 +2492,9 @@ def opencdr_ir_roles_upsert(
 
 
 @_tool(CAP_IR_ROLES, annotations=_DESTRUCTIVE)
-def opencdr_ir_roles_delete(aws_account_id: str, agent_id: str | None = None) -> dict:
+def opencdr_ir_roles_delete(
+    aws_account_id: str, agent_id: str | None = None, expected_rev: int | None = None
+) -> dict:
     """Delete the IR role mapping for an AWS account. DESTRUCTIVE.
 
     Removing a mapping means the responder falls back to its default role for
@@ -1039,7 +2503,11 @@ def opencdr_ir_roles_delete(aws_account_id: str, agent_id: str | None = None) ->
     aws_account_id = _require_account_id(aws_account_id)
     url, key = _resolve_api(agent_id)
     status, body = opencdr._request(
-        "DELETE", f"/ir-roles/{_seg(aws_account_id, 'aws_account_id')}", url, key
+        "DELETE",
+        f"/ir-roles/{_seg(aws_account_id, 'aws_account_id')}"
+        + ("?" + _qs(expected_rev=expected_rev) if expected_rev is not None else ""),
+        url,
+        key,
     )
     if status == 404:
         return {"found": False, "aws_account_id": aws_account_id}
@@ -1097,8 +2565,9 @@ def opencdr_ir_actions_rollback(
     isn't supported for this action.
 
     Returns as soon as the rollback is enqueued, not once it has run --
-    rollbackHandler executes it separately; poll opencdr_ir_actions_get for
-    the outcome.
+    rollbackHandler executes it separately. Prefer opencdr_response_outcomes
+    where available: legacy pending/failed metadata is not proof of an effect.
+    New workers block replay after any execution claim and preserve dry runs.
 
     `reason` is an optional human-readable justification (e.g. "containment
     determined to be a false positive"); when given it is recorded on the
@@ -1129,8 +2598,11 @@ _REGISTRATION_FIELDS = {
     "api_url",
     "enabled",
     "allow_writes",
+    "allow_triage",
     "settings_ids",
     "integration_ids",
+    "auth_mode",
+    "write_access",
 }
 
 
@@ -1144,7 +2616,11 @@ def _fleet_client() -> FleetClient:
 
 
 def _fleet_call(
-    method: str, path: str, payload: dict | None = None, *, fleet_client: FleetClient | None = None,
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    *,
+    fleet_client: FleetClient | None = None,
 ) -> dict:
     active = fleet_client or _fleet_client()
     status, body = active.verified_request(method, path, json_body=payload)
@@ -1237,12 +2713,102 @@ def opencdr_fleet_agent_refresh(agent_id: str) -> dict:
     return _fleet_call("POST", f"/v1/agents/{agent_identifier(agent_id)}/refresh")
 
 
+@_tool(CAP_FLEET_ADMIN, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_detection_handoff_context(agent_id: str) -> dict:
+    """Read exact durable cursor, receipt and guards for a Core handoff plan.
+
+    Administrator only. A null previous_owner requires corroborating the old
+    immutable principal from retained records; never substitute the new owner.
+    """
+    return _fleet_call("GET", f"/v1/agents/{agent_identifier(agent_id)}/detections/handoff")
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_DESTRUCTIVE, fleet_only=True)
+def opencdr_fleet_detection_handoff(
+    agent_id: str,
+    expected_generation: int,
+    expected_registration_rev: int,
+    handoff_id: str,
+    plan_digest: str,
+    target_owner: str,
+    reason: str,
+    request_id: str,
+    supersedes_request_id: str | None = None,
+) -> dict:
+    """Queue a reviewed handoff for acceptance by Fleet's detection worker.
+
+    Accepted intent is not completion. Inspect detection status; a retry requeues
+    pending intent even with schedules paused. Cursor, records and gaps survive.
+    """
+    for value in (expected_generation, expected_registration_rev):
+        if type(value) is not int or value < 1:
+            raise ValueError("Positive checkpoint generation and registration revision required")
+    _backfill_id(handoff_id)
+    _handoff_principal(target_owner)
+    if not re.fullmatch(r"[a-f0-9]{64}", plan_digest) or not re.fullmatch(
+        r"[a-f0-9]{32}", request_id
+    ):
+        raise ValueError("Reviewed digest and unique request ID required")
+    if not isinstance(reason, str) or not 1 <= len(reason) <= 512:
+        raise ValueError("A review reason is required")
+    body = {
+        "expected_generation": expected_generation,
+        "expected_registration_rev": expected_registration_rev,
+        "handoff_id": handoff_id,
+        "plan_digest": plan_digest,
+        "target_owner": target_owner,
+        "reason": reason,
+        "request_id": request_id,
+    }
+    if supersedes_request_id is not None:
+        if not re.fullmatch(r"[a-f0-9]{32}", supersedes_request_id):
+            raise ValueError("Invalid superseded request ID")
+        body["supersedes_request_id"] = supersedes_request_id
+    return _fleet_call("POST", f"/v1/agents/{agent_identifier(agent_id)}/detections/handoff", body)
+
+
+@_tool(CAP_FLEET_ADMIN, annotations=_DESTRUCTIVE, fleet_only=True)
+def opencdr_fleet_detection_reconcile(
+    agent_id: str,
+    expected_generation: int,
+    expected_registration_rev: int,
+    job_id: str,
+    plan_digest: str,
+    reason: str,
+    request_id: str,
+    accept_unrecoverable: bool = False,
+    supersedes_request_id: str | None = None,
+) -> dict:
+    """Queue reviewed gap recovery through Fleet's original detection worker.
+
+    Administrator only. Obtain checkpoint_generation and registration revision
+    from agent status, review the completed Core backfill and its findings, then
+    explicitly accept unavailable history. Acceptance does not mean completion;
+    inspect agent detection status. Correct a pending request only by explicitly
+    naming supersedes_request_id. The worker's consumer identity stays unchanged.
+    """
+    for value in (expected_generation, expected_registration_rev):
+        if type(value) is not int or value < 1:
+            raise ValueError("Positive checkpoint generation and registration revision required")
+    body = _reconciliation_body(job_id, plan_digest, reason, request_id, accept_unrecoverable)
+    body.update(
+        expected_generation=expected_generation, expected_registration_rev=expected_registration_rev
+    )
+    if supersedes_request_id is not None:
+        if not re.fullmatch(r"[a-f0-9]{32}", supersedes_request_id):
+            raise ValueError("Invalid supersedes_request_id")
+        body["supersedes_request_id"] = supersedes_request_id
+    return _fleet_call(
+        "POST", f"/v1/agents/{agent_identifier(agent_id)}/detections/reconcile", body
+    )
+
+
 @_tool(CAP_FLEET_ADMIN, annotations=_RELEASE, fleet_only=True)
 def opencdr_fleet_agent_register(registration: dict) -> dict:
     """Register a reviewed Core agent. Requires administrator profile and fleet IAM registry access.
 
-    Keys must already exist in fleet SSM; this tool accepts no credentials and
-    creates no AWS users, roles or keys. Use opencdr-deploy for credential setup.
+    IAM registrations require Core to trust the selected Fleet execution roles.
+    Legacy keys must already exist in Fleet SSM. This tool accepts no credentials.
     Start with allow_writes=false. Core remains the execution authority.
     """
     return _fleet_call("POST", "/v1/agents", _fleet_registration(registration))
@@ -1343,6 +2909,254 @@ def opencdr_fleet_request(
     No retries; inspect every partial/uncertain result. Paths must start with /v1/.
     """
     return _fleet_call(method, relative_path(path), body)
+
+
+def _rollout_id(value: str) -> str:
+    if not re.fullmatch(r"(operator|responder|administrator)-[a-f0-9]{32}", value):
+        raise ValueError("Invalid rollout ID")
+    return value
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, fleet_only=True)
+def opencdr_fleet_rollout_plan(agent_ids: list[str], manifest: dict) -> dict:
+    """Persist a plan for 1–8 explicit targets. Review every operation and retain review_digest.
+
+    This writes Fleet planning metadata but never changes Core configuration.
+    """
+    return _fleet_call("POST", "/v1/rollouts/plan", {"agent_ids": agent_ids, "manifest": manifest})
+
+
+@_tool(CAP_RULES, annotations=_RELEASE, fleet_only=True)
+def opencdr_fleet_rollout_apply(rollout_id: str, review_digest: str) -> dict:
+    """Queue only the original reviewed per-target plans. May disable or delete rules.
+
+    Delivery is idempotent. Partial or unknown outcomes require inspection and
+    a new reviewed plan, never blind replay. API acceptance is not runtime activation.
+    """
+    return _fleet_call(
+        "POST", f"/v1/rollouts/{_rollout_id(rollout_id)}/apply", {"review_digest": review_digest}
+    )
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_rollout_status(rollout_id: str) -> dict:
+    """Read durable per-agent outcomes, including partial and unknown results."""
+    return _fleet_call("GET", f"/v1/rollouts/{_rollout_id(rollout_id)}")
+
+
+@_tool(CAP_RULES, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_rollout_drift(rollout_id: str, after: str | None = None) -> dict:
+    """Compare live rules to a rollout manifest. Report differences without applying them."""
+    return _fleet_call(
+        "POST", f"/v1/rollouts/{_rollout_id(rollout_id)}/drift", {"after": after} if after else {}
+    )
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, fleet_only=True)
+def opencdr_fleet_distribution_plan(
+    targets: list[dict], request_id: str, reason: str, allocation: dict | None = None
+) -> dict:
+    """Freeze 1–100 explicit targets and their exact Core approval IDs/revisions.
+
+    Membership changes cannot expand this plan. Preparation resolves at most eight
+    members per request. An independently approved Fleet proposal is still required.
+    """
+    if not isinstance(targets, list) or not 1 <= len(targets) <= 100:
+        raise ValueError("Select 1 to 100 exact targets")
+    _case_id(request_id)
+    for target in targets:
+        if not isinstance(target, dict) or set(target) != {
+            "agent_id",
+            "approval_id",
+            "expected_rev",
+        }:
+            raise ValueError("Invalid distribution target")
+        _case_id(target["approval_id"])
+        if type(target["expected_rev"]) is not int or target["expected_rev"] < 1:
+            raise ValueError("Invalid Core approval revision")
+    if allocation is not None:
+        if not isinstance(allocation, dict) or set(allocation) != {"group_id", "expected_rev"}:
+            raise ValueError("Exact allocation group and revision required")
+        _group_id(allocation["group_id"])
+        if type(allocation["expected_rev"]) is not int or allocation["expected_rev"] < 1:
+            raise ValueError("Exact allocation revision required")
+    return _fleet_call(
+        "POST",
+        "/v1/rollouts/plan",
+        {
+            "targets": targets,
+            "request_id": request_id,
+            "reason": reason,
+            **({"allocation": allocation} if allocation is not None else {}),
+        },
+    )
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, fleet_only=True)
+def opencdr_fleet_distribution_prepare(rollout_id: str) -> dict:
+    """Resolve one bounded preparation batch; repeat until the frozen job is ready."""
+    return _fleet_call("POST", f"/v1/rollouts/{_rollout_id(rollout_id)}/prepare", {})
+
+
+@_tool(CAP_RULES, annotations=_RELEASE, fleet_only=True)
+def opencdr_fleet_distribution_apply(rollout_id: str, payload: dict) -> dict:
+    """Queue an approved job with live authority. Never replay uncertain targets."""
+    _execution_payload(payload, {"approval_id"})
+    _case_id(payload["approval_id"])
+    return _fleet_call("POST", f"/v1/rollouts/{_rollout_id(rollout_id)}/apply", payload)
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, fleet_only=True)
+def opencdr_fleet_distribution_reconcile(rollout_id: str, agent_id: str) -> dict:
+    """Read a member's receipt and verification; retain the result without resending."""
+    if not isinstance(agent_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", agent_id
+    ):
+        raise ValueError("Invalid agent ID")
+    return _fleet_call("POST", f"/v1/rollouts/{_rollout_id(rollout_id)}/reconcile/{agent_id}", {})
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, fleet_only=True)
+def opencdr_fleet_distribution_cancel(rollout_id: str, payload: dict) -> dict:
+    """Stop remaining targets. Retain sending, unknown and completed outcomes."""
+    if not isinstance(payload, dict) or set(payload) != {"review_digest", "request_id", "reason"}:
+        raise ValueError("Invalid cancellation fields")
+    _case_id(payload["request_id"])
+    if not isinstance(payload["review_digest"], str) or not re.fullmatch(
+        r"[a-f0-9]{64}", payload["review_digest"]
+    ):
+        raise ValueError("An exact review digest is required")
+    return _fleet_call("POST", f"/v1/rollouts/{_rollout_id(rollout_id)}/cancel", payload)
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_groups(
+    group_id: str | None = None, limit: int = 20, after: str | None = None
+) -> dict:
+    """Read Fleet-owned groups/rings; listing is scoped and cursor bounded."""
+    if group_id is not None:
+        if after is not None:
+            raise ValueError("A group detail does not accept a cursor")
+        return _fleet_call("GET", "/v1/groups/" + _group_id(group_id))
+    if (
+        type(limit) is not int
+        or not 1 <= limit <= 50
+        or (after is not None and (not isinstance(after, str) or not 1 <= len(after) <= 4096))
+    ):
+        raise ValueError("Invalid group page")
+    return _fleet_call("GET", "/v1/groups?" + _qs(limit=limit, after=after))
+
+
+def _group_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", value):
+        raise ValueError("Invalid group ID")
+    return value
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_group_resolve(group_id: str, expected_rev: int) -> dict:
+    """Resolve at most 100 exact members of a known group revision; never dispatch."""
+    identity = _group_id(group_id)
+    if type(expected_rev) is not int or expected_rev < 1:
+        raise ValueError("An exact group revision is required")
+    return _fleet_call(
+        "POST", "/v1/groups/" + identity + "/resolve", {"expected_rev": expected_rev}
+    )
+
+
+@_tool(CAP_RULES, annotations=_RELEASE, fleet_only=True)
+def opencdr_fleet_review_execute(approval_id: str, payload: dict) -> dict:
+    """Execute a reviewed Fleet group/ring configuration; never proxy a Core mutation.
+
+    Propose group.configure through opencdr_review_propose, record a separate
+    review decision, then execute the exact approved revision with a retained ID.
+    """
+    return _fleet_call(
+        "POST", "/v1/reviews/" + _case_id(approval_id) + "/execute", _execution_payload(payload)
+    )
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, fleet_only=True)
+def opencdr_fleet_review_execution(approval_id: str, verify: bool = False) -> dict:
+    """Read a Fleet configuration receipt or compare the retained group version."""
+    if type(verify) is not bool:
+        raise ValueError("verify must be boolean")
+    return _fleet_call(
+        "GET",
+        "/v1/reviews/" + _case_id(approval_id) + ("/verification" if verify else "/execution"),
+    )
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_configuration_flags() -> dict:
+    """Read owner runtime flag types/permissions and the separate Deploy application mechanism."""
+    return _review_call("GET", "/configuration/flags")
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY)
+def opencdr_configuration_ownership(agent_id: str | None = None) -> dict:
+    """Read Core local/central bindings; reviewed owner-admin changes transfer control."""
+    url, key = _resolve_api(agent_id)
+    status, body = opencdr._request("GET", "/configuration/ownership", url, key)
+    _raise_on_error(status, body, "configuration ownership")
+    return body
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, central=True)
+def opencdr_routing_drain(approval_id: str, payload: dict) -> dict:
+    """Process at most 20 retained entries at the case owner under its active approval.
+
+    Includes agent_id plus expected_rev/request_id/reason. Preserve request_id on
+    unknown outcome; a new request drains the next page. No caller cursor or event
+    payload is accepted. Imported history cannot create cases or call providers.
+    """
+    _execution_payload(payload, extra=("agent_id",))
+    if not isinstance(payload["agent_id"], str) or not 1 <= len(payload["agent_id"]) <= 128:
+        raise ValueError("An exact source agent is required")
+    return _review_call("POST", "/reviews/" + _case_id(approval_id) + "/drain", payload)
+
+
+@_tool(CAP_RULES, annotations=_MUTATING, central=True)
+def opencdr_case_tuning_draft(case_id: str, payload: dict) -> dict:
+    """Save a disabled Library version from exact retained case/rule evidence.
+
+    Requires current triage and Library authority. Supply case_rev, attachment_id,
+    pinned source reference, proposed document, expected_rev of the Library head,
+    request_id and reason. This never promotes a rule or invokes a provider.
+    """
+    _execution_payload(payload, extra=("case_rev", "attachment_id", "source", "document"))
+    return _case_call("POST", "/cases/" + _case_id(case_id) + "/tuning-draft", payload)
+
+
+
+@_tool(CAP_READ, annotations=_READ_ONLY, central=True)
+def opencdr_case_extensions(case_id: str, kind: str, after: str | None = None) -> dict:
+    """Read 20 case-owned indicators or historical provider-results.
+
+    Uses Fleet authority directly in fleet mode; never executes a lookup.
+    """
+    if kind not in {"indicators", "provider-results"}:
+        raise ValueError("Choose indicators or provider-results")
+    if after is not None and (not isinstance(after, str) or not 1 <= len(after) <= 2048):
+        raise ValueError("Use the exact bounded owner cursor")
+    path = "/cases/" + _case_id(case_id) + "/extensions/" + kind
+    return _case_call("GET", path + ("?" + _qs(after=after) if after else ""))
+
+
+@_tool(CAP_TRIAGE, annotations=_MUTATING, central=True)
+def opencdr_case_extension_save(case_id: str, kind: str, payload: dict) -> dict:
+    """Curate indicators or retain historical provider evidence at the case owner.
+
+    Uses Fleet authority directly in fleet mode.
+    History is immutable and explicitly unverified; importing it cannot enqueue
+    lookups, send notifications, or authorize paid work. Preserve request_id on an
+    unknown result. Current case revision and all case account grants are required.
+    """
+    if kind not in {"indicators", "provider-results"}:
+        raise ValueError("Choose indicators or provider-results")
+    extra = ("indicator", "relationship", "note", "source") if kind == "indicators" else ("provider", "reference", "source_sha256", "observed_at", "result", "indicator")
+    _execution_payload(payload, extra=extra)
+    return _case_call("POST", "/cases/" + _case_id(case_id) + "/extensions/" + kind, payload)
 
 
 def main() -> None:

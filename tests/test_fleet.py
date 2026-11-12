@@ -80,11 +80,45 @@ def envelope(agent, body, status=200, **fields):
     }
 
 
-def test_every_existing_core_tool_has_an_explicit_agent_selector():
-    assert len(server._TOOL_CAPS) == 35
+def test_core_tools_declare_single_agent_or_central_query_scope():
+    assert len(server._TOOL_CAPS) == 77
     for name in server._TOOL_CAPS:
         function = getattr(server, name)
-        assert "agent_id" in inspect.signature(function).parameters, name
+        if name in {
+            "opencdr_case_extensions",
+            "opencdr_case_extension_save",
+            "opencdr_library_read",
+            "opencdr_library_evidence",
+            "opencdr_library_runtime_source",
+            "opencdr_library_quality",
+            "opencdr_library_write",
+            "opencdr_case_read",
+            "opencdr_case_mutate",
+            "opencdr_cases_list",
+            "opencdr_case_active",
+            "opencdr_case_integration",
+        }:
+            assert "Fleet authority directly" in function.__doc__
+            continue
+        if name in {
+            "opencdr_configuration_flags",
+            "opencdr_routing_drain",
+            "opencdr_case_tuning_draft",
+            "opencdr_reviews_read",
+            "opencdr_review_decide",
+            "opencdr_review_propose",
+            "opencdr_case_routing_preview",
+            "opencdr_routing_activate",
+            "opencdr_routing_activation",
+        }:
+            assert "Fleet authority directly" in function.__doc__
+            continue
+        if name in {"opencdr_review_execute", "opencdr_review_execution", "opencdr_review_cancel"}:
+            assert "Standalone Core only" in function.__doc__
+            assert name not in server.allowed_tools("administrator", mode="fleet")
+            continue
+        selector = "agent_ids" if name == "opencdr_detections_query" else "agent_id"
+        assert selector in inspect.signature(function).parameters, name
         assert "fleet mode" in function.__doc__.lower()
 
 

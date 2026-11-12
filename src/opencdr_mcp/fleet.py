@@ -50,6 +50,8 @@ class FleetConnection:
     security_account_id: str
     region: str
     stage: str
+    access: str = ""
+    identity: dict | None = None
 
     @classmethod
     def from_config(cls, config: dict[str, Any]):
@@ -83,13 +85,25 @@ class FleetConnection:
             security_account_id=value("OPENCDR_FLEET_ACCOUNT_ID", "security_account_id"),
             region=value("OPENCDR_FLEET_REGION", "region"),
             stage=value("OPENCDR_FLEET_STAGE", "stage"),
+            access=value("OPENCDR_FLEET_ACCESS", "access"),
+            identity=values.get("identity"),
         )
         connection.validate()
         return connection
 
     def validate(self):
-        if not all(isinstance(value, str) for value in vars(self).values()):
+        if self.access not in {"", "observer", "triage", "operator", "responder", "administrator"}:
+            raise FleetError("Invalid Fleet management access")
+        if not all(
+            isinstance(value, str) for key, value in vars(self).items() if key != "identity"
+        ):
             raise FleetError("Fleet URL, profile, account, region and stage must be strings")
+        from .delegation import delegated_request
+
+        try:
+            delegated_request("GET", "/v1/status", None, self.identity, {}, prefix="/v1")
+        except ValueError as error:
+            raise FleetError(str(error)) from error
         if not re.fullmatch(r"\d{12}", self.security_account_id):
             raise FleetError("Set the expected fleet security_account_id (12 digits)")
         if not self.aws_profile or not isinstance(self.aws_profile, str):
@@ -125,9 +139,13 @@ class FleetClient:
         self.connection = connection
         self._session = None
         self._verified = False
+        self.base_url = connection.url.rstrip("/")
+        if connection.access:
+            self.base_url += "/management/" + connection.access
+        self.path_prefix = "/v1/"
 
     def request(self, method: str, path: str, *, json_body=None, params=None):
-        relative_path(path)
+        relative_path(path, self.path_prefix)
         if method not in {"GET", "POST", "PUT", "DELETE"}:
             raise FleetError("Unsupported fleet HTTP method")
         if method == "GET" and json_body is not None:
@@ -145,9 +163,35 @@ class FleetClient:
             credentials = self._session.get_credentials()
             if credentials is None:
                 raise FleetError("AWS credentials unavailable; sign in to the saved AWS profile")
-            prepared = requests.Request(
-                method, self.connection.url.rstrip("/") + path, params=params
-            ).prepare()
+            prepared = requests.Request(method, self.base_url + path, params=params).prepare()
+            if self.connection.identity is not None:
+                from .delegation import delegated_request
+
+                query = urlsplit(prepared.url).query
+                relative = urlsplit(path).path + ("?" + query if query else "")
+                try:
+                    method, path, json_body = delegated_request(
+                        method,
+                        relative,
+                        json_body,
+                        self.connection.identity,
+                        {
+                            "account_id": self.connection.security_account_id,
+                            "home_region": self.connection.region,
+                            "stage": self.connection.stage,
+                        },
+                        prefix=self.path_prefix.rstrip("/"),
+                    )
+                except ValueError as error:
+                    raise FleetError(str(error)) from error
+                prepared = requests.Request(method, self.base_url + path).prepare()
+                payload = (
+                    json.dumps(json_body, separators=(",", ":")).encode()
+                    if json_body is not None
+                    else None
+                )
+            if payload is not None and len(payload) > 2_000_000:
+                raise FleetError("Fleet request exceeds 2 MB including identity assertion")
             signed = AWSRequest(
                 method=method,
                 url=prepared.url,
@@ -169,8 +213,8 @@ class FleetClient:
                 content, size = [], 0
                 for chunk in response.iter_content(64 * 1024):
                     size += len(chunk)
-                    if size > 2_000_000:
-                        raise FleetError("Fleet response exceeds 2 MB; use narrower pagination")
+                    if size > 4_000_000:
+                        raise FleetError("Fleet response exceeds 4 MB; use narrower pagination")
                     content.append(chunk)
                 raw = b"".join(content)
                 try:

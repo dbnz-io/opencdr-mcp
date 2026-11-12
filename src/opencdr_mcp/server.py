@@ -3128,7 +3128,6 @@ def opencdr_case_tuning_draft(case_id: str, payload: dict) -> dict:
     return _case_call("POST", "/cases/" + _case_id(case_id) + "/tuning-draft", payload)
 
 
-
 @_tool(CAP_READ, annotations=_READ_ONLY, central=True)
 def opencdr_case_extensions(case_id: str, kind: str, after: str | None = None) -> dict:
     """Read 20 case-owned indicators or historical provider-results.
@@ -3154,7 +3153,11 @@ def opencdr_case_extension_save(case_id: str, kind: str, payload: dict) -> dict:
     """
     if kind not in {"indicators", "provider-results"}:
         raise ValueError("Choose indicators or provider-results")
-    extra = ("indicator", "relationship", "note", "source") if kind == "indicators" else ("provider", "reference", "source_sha256", "observed_at", "result", "indicator")
+    extra = (
+        ("indicator", "relationship", "note", "source")
+        if kind == "indicators"
+        else ("provider", "reference", "source_sha256", "observed_at", "result", "indicator")
+    )
     _execution_payload(payload, extra=extra)
     return _case_call("POST", "/cases/" + _case_id(case_id) + "/extensions/" + kind, payload)
 

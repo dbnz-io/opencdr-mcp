@@ -139,7 +139,9 @@ def test_extension_history_is_scoped_bounded_and_never_executes(monkeypatch):
     call = MagicMock(return_value={"execution_authorized": False})
     monkeypatch.setattr(server, "_case_call", call)
     server.opencdr_case_extensions("b" * 32, "provider-results", "opaque")
-    call.assert_called_once_with("GET", "/cases/" + "b" * 32 + "/extensions/provider-results?after=opaque")
+    call.assert_called_once_with(
+        "GET", "/cases/" + "b" * 32 + "/extensions/provider-results?after=opaque"
+    )
     assert "opencdr_case_extensions" in server.allowed_tools("observer")
     assert "opencdr_case_extension_save" not in server.allowed_tools("observer")
     assert "opencdr_case_extension_save" in server.allowed_tools("triage")

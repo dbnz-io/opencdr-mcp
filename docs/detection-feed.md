@@ -21,7 +21,7 @@ use `opencdr_fleet_detection_handoff_context` and
 The old consumer is retired atomically; progress and pending receipts survive.
 Inspect completion separately from HTTP 202. A handoff never clears retention
 gaps, resumes scheduled polling or repairs a changed feed incarnation. See the
-workspace [operator procedure](../../opencdr-internal/docs/detection-handoffs.md).
+workspace [operator procedure](https://github.com/dbnz-io/opencdr/blob/main/docs/detection-handoffs.md).
 
 `opencdr_detections_feed` reads both native signals and correlated alerts from
 Core's IAM-only `/detections/feed` endpoint. Core must advertise `detection_feed`
@@ -74,6 +74,6 @@ apply. `opencdr_detection_consumer_recover` uses direct IAM delivery to create a
 fresh namespace from a reviewed completed backfill. Fleet uses administrator
 `opencdr_fleet_detection_recovery_context` and `opencdr_fleet_detection_recover`
 so its worker accepts as itself. Normal polling must be paused; completion does
-not resume it. See the [full procedure](../../opencdr-internal/docs/detection-feed-recovery.md)
+not resume it. See the [full procedure](https://github.com/dbnz-io/opencdr/blob/main/docs/detection-feed-recovery.md)
 for guards, accepted uncertainty, retries, cost measurements and remaining PITR/
 activation gates.

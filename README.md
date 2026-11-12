@@ -324,7 +324,7 @@ revision checks and stable request IDs. Cases track SIEM work; they do not run
 investigations or change detection handling. Fleet requires explicit principal
 account grants, even for administrators, and never fans out case reads to Core.
 
-Use the [owner deployment/test and KPI guide](../opencdr-internal/docs/operational-cases.md) for grants, Deploy commands,
+Use the [owner deployment/test and KPI guide](https://github.com/dbnz-io/opencdr/blob/main/docs/operational-cases.md) for grants, Deploy commands,
 limits, failure scenarios and remaining live/retention/migration gates. This
 candidate is locally tested; it has not been deployed or publicly promoted.
 
@@ -362,7 +362,7 @@ Every write needs a stable request ID and reason; item updates/version saves
 also require the current revision. Unknown outcomes must be retried unchanged.
 Saved versions are unvalidated; import metadata is caller-declared. These tools
 never fetch Git, approve, deploy or execute rules. See the coordinated
-[library manual](../opencdr-internal/docs/content-library.md). Hosted SaaS MCP and
+[library manual](https://github.com/dbnz-io/opencdr/blob/main/docs/content-library.md). Hosted SaaS MCP and
 assistant migration remain separate roadmap work.
 
 ### P4–P6 local candidate (2026-11-11)
@@ -371,5 +371,5 @@ Owner review registry/inbox/decisions and owner-local routing previews are now
 implemented locally. Fleet also negotiates complete saved-profile/binding
 inventory with compatible Core agents. These changes are undeployed and are not
 approval-enforced jobs or automatic case routing. See the coordinated
-[implementation and CLI guide](../opencdr-internal/docs/p4-p6-local-implementation-2026-11-11.md)
+[implementation and CLI guide](https://github.com/dbnz-io/opencdr/blob/main/docs/p4-p6-local-implementation-2026-11-11.md)
 for capabilities, limits, evidence and remaining acceptance gates.
